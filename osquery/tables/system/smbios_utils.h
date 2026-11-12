@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <string>
+
 #include <osquery/core/tables.h>
 
 namespace osquery {
@@ -49,9 +51,13 @@ extern const std::map<uint8_t, std::string> kSMBIOSMemoryErrorOperationTable;
 /// Get friendly names for each SMBIOS table/section type.
 extern const std::map<uint8_t, std::string> kSMBIOSTypeDescriptions;
 
+extern const std::map<std::string, std::string>
+    kSMBIOSProcessorTypeFriendlyName;
+
 constexpr uint8_t kSMBIOSTypeBIOS = 0;
 constexpr uint8_t kSMBIOSTypeSystem = 1;
 constexpr uint8_t kSMBIOSTypeBoard = 2;
+constexpr uint8_t kSMBIOSTypeProcessor = 4;
 constexpr uint8_t kSMBIOSTypeOEMStrings = 11;
 constexpr uint8_t kSMBIOSTypeMemoryArray = 16;
 constexpr uint8_t kSMBIOSTypeMemoryDevice = 17;
@@ -135,6 +141,14 @@ void genSMBIOSOEMStrings(const SMBStructHeader* hdr,
                          uint8_t* textAddrs,
                          size_t size,
                          QueryData& results);
+
+/// Helper, cross platform, table generator for processor.
+void genSMBIOSProcessor(size_t index,
+                        const SMBStructHeader* hdr,
+                        uint8_t* address,
+                        uint8_t* textAddrs,
+                        size_t size,
+                        QueryData& results);
 
 /**
  * @brief Return a 0-terminated strings from an SMBIOS address and handle.

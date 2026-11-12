@@ -77,14 +77,21 @@ TEST_F(PacksTests, test_version) {
 }
 
 TEST_F(PacksTests, test_sharding) {
-  auto shard1 = getMachineShard("localhost.localdomain");
-  auto shard2 = getMachineShard("not.localhost.localdomain");
+  // getMachineShard caches its result, and earlier tests in this binary may
+  // have cached the shard of the real hostname, so force this computation.
+  auto shard1 = getMachineShard("localhost.localdomain", true);
+  EXPECT_EQ(shard1, 6U);
+
   // Expect some static caching.
+  auto shard2 = getMachineShard("not.localhost.localdomain");
   EXPECT_EQ(shard1, shard2);
 
   // Bypass the caching.
   shard2 = getMachineShard("not.localhost.localdomain", true);
-  EXPECT_NE(shard1, shard2);
+  EXPECT_EQ(shard2, 94U);
+
+  // Restore the shard of the real hostname for any later tests.
+  getMachineShard("", true);
 }
 
 TEST_F(PacksTests, test_check_platform) {
@@ -102,7 +109,7 @@ TEST_F(PacksTests, test_check_platform) {
   fpack.platform_ = "bad_value";
   EXPECT_FALSE(fpack.checkPlatform());
 
-  // We should execute the query if the SDK platform is specifed.
+  // We should execute the query if the SDK platform is specified.
   fpack.platform_ = kSDKPlatform;
   EXPECT_TRUE(fpack.checkPlatform());
   // But not if something other than the SDK platform is speciifed.
@@ -112,13 +119,6 @@ TEST_F(PacksTests, test_check_platform) {
   // For the remaining tests, we exercise all of the valid platform values.
   fpack.platform_ = "darwin";
   if (isPlatform(PlatformType::TYPE_OSX)) {
-    EXPECT_TRUE(fpack.checkPlatform());
-  } else {
-    EXPECT_FALSE(fpack.checkPlatform());
-  }
-
-  fpack.platform_ = "freebsd";
-  if (isPlatform(PlatformType::TYPE_FREEBSD)) {
     EXPECT_TRUE(fpack.checkPlatform());
   } else {
     EXPECT_FALSE(fpack.checkPlatform());

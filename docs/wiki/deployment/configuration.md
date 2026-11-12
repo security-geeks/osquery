@@ -83,7 +83,7 @@ the next section on [logging](../deployment/logging.md), and the below configura
 itself has been running before the scheduled query will be executed. If the
 system is suspended or put to sleep the progression of time "freezes" and
 resumes when the system comes back online. For example a scheduled query with
-an interval of `84600`, or 24 hours, running on a laptop system could take
+an interval of `86400`, or 24 hours, running on a laptop system could take
 a few days before the query executes if the system is suspended at night.
 
 ## Query Packs
@@ -319,13 +319,13 @@ The basic scheduled query specification includes:
 - `version`: only run on osquery versions greater than or equal-to this version string
 - `shard`: restrict this query to a percentage (1-100) of target hosts
 - `denylist`: a boolean to determine if this query may be denylisted (when stopped by the Watchdog for excessive resource consumption), default true
+- `startup_priority`: an unsigned integer to set the order of executing scheduled queries on startup, default is UINT64_MAX
 
 The `platform` key can be:
 
 - `darwin` for macOS hosts
-- `freebsd` for FreeBSD hosts
 - `linux` for any RedHat or Debian-based hosts
-- `posix` for `darwin`, `freebsd`, and `linux` hosts
+- `posix` for `darwin` and `linux` hosts
 - `windows` for any Windows desktop or server hosts
 - `any` or `all` for all, alternatively no platform key selects all
 
@@ -339,6 +339,8 @@ Snapshot queries, those with `snapshot: true` will not store differentials and w
 the next section on [logging](../deployment/logging.md) for examples of each log output.
 
 Queries may be "denylisted" if they cause osquery to use excessive system resources. A denylisted query returns to the schedule after a cool-down period of 1 day. Some queries may be very important and you may request that they continue to run even if they are latent. Set the `denylist: false` to prevent a query from being denylisted.
+
+Note that queries which leave `startup_priority` as the default value will not execute at startup. When using watchdog, scheduled queries running on startup will generally run before watchdog starts. The watchdog start delay can be adjusted with `watchdog_delay` (default: 60), but running many queries on startup may be resource demanding, and thus could cause the watchdog to deny the startup queries if the delay is too short.
 
 ### Packs
 
@@ -463,7 +465,7 @@ Like EC2, there are two tables that provide Azure instance related information. 
 
 ### Decorator queries
 
-Decorator queries exist in osquery versions 1.7.3+ and are used to add additional "decorations" to results and snapshot logs. There are three types of decorator queries based on when and how you want the decoration data.
+Decorator queries exist in osquery versions 1.7.3+ and are used to add additional "decorations" to results, snapshot and status logs. There are three types of decorator queries based on when and how you want the decoration data.
 
 ```json
 {
@@ -548,13 +550,12 @@ Example:
 {
   "auto_table_construction": {
     "tcc_system_entries": {
-      "query": "SELECT service, client, allowed, prompt_count, last_modified FROM access;",
+      "query": "SELECT service, client, auth_value, last_modified FROM access;",
       "path": "/Library/Application Support/com.apple.TCC/TCC.db",
       "columns": [
         "service",
         "client",
-        "allowed",
-        "prompt_count",
+        "auth_value",
         "last_modified"
       ],
       "platform": "darwin"
@@ -584,7 +585,7 @@ If you run `select * from access`, you'll see this table contains permissions gr
 
 ```
 sqlite> .schema access
-CREATE TABLE access (    service        TEXT        NOT NULL,     client         TEXT        NOT NULL,     client_type    INTEGER     NOT NULL,     allowed        INTEGER     NOT NULL,     prompt_count   INTEGER     NOT NULL,     csreq          BLOB,     policy_id      INTEGER,     indirect_object_identifier_type    INTEGER,     indirect_object_identifier         TEXT,     indirect_object_code_identity      BLOB,     flags          INTEGER,     last_modified  INTEGER     NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),     PRIMARY KEY (service, client, client_type, indirect_object_identifier),    FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE TABLE access (  service    TEXT    NOT NULL,   client     TEXT    NOT NULL,   client_type  INTEGER   NOT NULL,   auth_value   INTEGER   NOT NULL,   auth_reason  INTEGER   NOT NULL,   auth_version  INTEGER   NOT NULL,   csreq     BLOB,   policy_id   INTEGER,   indirect_object_identifier_type  INTEGER,   indirect_object_identifier     TEXT NOT NULL DEFAULT 'UNUSED',   indirect_object_code_identity   BLOB,   flags     INTEGER,   last_modified INTEGER   NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),   PRIMARY KEY (service, client, client_type, indirect_object_identifier),  FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE CASCADE ON UPDATE CASCADE);
 ```
 
 Open a text editor and create a file named `atc_tables.json` using the columns, path, and SQLite table you discovered:
@@ -593,25 +594,23 @@ Open a text editor and create a file named `atc_tables.json` using the columns, 
 {
   "auto_table_construction": {
     "tcc_system_entries": {
-      "query": "SELECT service, client, allowed, prompt_count, last_modified FROM access;",
+      "query": "SELECT service, client, auth_value, last_modified FROM access;",
       "path": "/Library/Application Support/com.apple.TCC/TCC.db",
       "columns": [
         "service",
         "client",
-        "allowed",
-        "prompt_count",
+        "auth_value",
         "last_modified"
       ],
       "platform": "darwin"
     },
     "tcc_user_entries": {
-      "query": "SELECT service, client, allowed, prompt_count, last_modified FROM access;",
+      "query": "SELECT service, client, auth_value, last_modified FROM access;",
       "path": "/Users/%/Library/Application Support/com.apple.TCC/TCC.db",
       "columns": [
         "service",
         "client",
-        "allowed",
-        "prompt_count",
+        "auth_value",
         "last_modified"
       ],
       "platform": "darwin"
@@ -631,8 +630,8 @@ See the [development documentation](../development/pubsub-framework.md) for more
 Events are almost always tweaked via CLI flags and _options_ referenced above.
 
 The configuration supports a method to explicitly allow and deny events subscribers.
-If you choose to explicitly allow subscribers, then all will be disabled except for those specificied in the allow list.
-If you choose to explicitly deny subscribers, then all will be enabled except for those specificied in the deny list.
+If you choose to explicitly allow subscribers, then all will be disabled except for those specified in the allow list.
+If you choose to explicitly deny subscribers, then all will be enabled except for those specified in the deny list.
 
 You may want to explicitly disable subscribers if you are only interested in a single type of data produced by a general publisher.
 
@@ -650,7 +649,7 @@ Here is an example configuration:
 You can inspect the list of subscribers using the query `SELECT * FROM osquery_events where type = 'subscriber';`.
 This table will show `1` for the `active` column if a subscriber is enabled.
 Note that publishers are more complex and cannot be disabled and enabled this way, please look for a specific CLI flag to control specific publishers.
-Also note that different platforms such as Windows and Linux have different sets of subscriber tables. 
+Also note that different platforms such as Windows and Linux have different sets of subscriber tables.
 
 ## Chef Configuration
 
@@ -662,7 +661,7 @@ Consider the default recipe:
 
 ```ruby
 # Domain used by the macOS LaunchDaemon.
-domain = 'com.facebook.osquery.osqueryd'
+domain = 'io.osquery.agent'
 config_path = '/var/osquery/osquery.conf'
 pid_path = '/var/osquery/osquery.pid'
 flagfile = '/var/osquery/osquery.flags'
@@ -720,7 +719,7 @@ And the following files/templates used by the recipe:
   <string><%= @domain %></string>
   <key>ProgramArguments</key>
   <array>
-      <string>/usr/local/bin/osqueryd</string>
+      <string>/opt/osquery/lib/osquery.app/Contents/MacOS/osqueryd</string>
       <string>--config_path</string>
       <string><%= @config_path %></string>
       <string>--pidfile</string>
@@ -740,7 +739,7 @@ And the following files/templates used by the recipe:
 </plist>
 ```
 
-**files/default/com.facebook.osquery.osqueryd.conf**
+**files/default/io.osquery.agent.conf**
 
 ```shell
 # logfilename                         [owner:group]  mode count size   when  flags [/pid_file] [sig_num]

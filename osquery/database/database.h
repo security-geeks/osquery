@@ -52,6 +52,21 @@ extern const std::string kCarves;
 /// The key for the DB version
 extern const std::string kDbVersionKey;
 
+/// The "domain" where distributed queries are stored.
+extern const std::string kDistributedQueries;
+
+/// The "domain" where currently running distributed queries are stored.
+extern const std::string kDistributedRunningQueries;
+
+/// The "domain" where query performance stats are stored.
+extern const std::string kQueryPerformance;
+
+// Vector of reserved prefixes used for storing query metadata
+extern const std::vector<std::string> kReservedDbPrefixes;
+
+// Vector of reserved suffixes used for storing query metadata
+extern const std::vector<std::string> kReservedDbSuffixes;
+
 /// The running version of our database schema
 const int kDbCurrentVersion = 2;
 

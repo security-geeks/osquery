@@ -8,7 +8,7 @@
  */
 
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/io/detail/quoted_manip.hpp>
+#include <boost/io/quoted.hpp>
 #include <boost/property_tree/json_parser.hpp>
 
 #include <osquery/core/flagalias.h>
@@ -45,14 +45,28 @@ const std::string kQueries = "queries";
 const std::string kEvents = "events";
 const std::string kCarves = "carves";
 const std::string kLogs = "logs";
+const std::string kDistributedQueries = "distributed";
+const std::string kDistributedRunningQueries = "distributed_running";
+const std::string kQueryPerformance = "query_performance";
 
 const std::string kDbEpochSuffix = "epoch";
 const std::string kDbCounterSuffix = "counter";
 
 const std::string kDbVersionKey = "results_version";
 
-const std::vector<std::string> kDomains = {
-    kPersistentSettings, kQueries, kEvents, kLogs, kCarves};
+const std::vector<std::string> kDomains = {kPersistentSettings,
+                                           kQueries,
+                                           kEvents,
+                                           kLogs,
+                                           kCarves,
+                                           kDistributedQueries,
+                                           kDistributedRunningQueries,
+                                           kQueryPerformance};
+
+const std::vector<std::string> kReservedDbPrefixes = {
+    "query.", "cache.", "config_views."};
+const std::vector<std::string> kReservedDbSuffixes = {kDbEpochSuffix,
+                                                      kDbCounterSuffix};
 
 std::atomic<bool> kDBAllowOpen(false);
 std::atomic<bool> kDBInitialized(false);
@@ -494,6 +508,7 @@ Status initDatabasePluginForTesting() {
   FLAGS_disable_database = true;
   setDatabaseAllowOpen();
   initDatabasePlugin();
+  resetDatabase();
   return Status::success();
 }
 
@@ -527,7 +542,7 @@ Status ptreeToRapidJSON(const std::string& in, std::string& out) {
     if (row.Parse(ss.str()).HasParseError()) {
       return Status(1, "Failed to serialize JSON");
     }
-    json.push(row);
+    json.pushCopy(row);
   }
 
   json.toString(out);
@@ -546,7 +561,8 @@ static Status migrateV0V1(void) {
     // Skip over epoch and counter entries, as 0 is parsed by ptree
     if (boost::algorithm::ends_with(key, kDbEpochSuffix) ||
         boost::algorithm::ends_with(key, kDbCounterSuffix) ||
-        boost::algorithm::starts_with(key, "query.")) {
+        boost::algorithm::starts_with(key, "query.") ||
+        boost::algorithm::starts_with(key, "config_views.")) {
       continue;
     }
 
@@ -635,6 +651,9 @@ Status upgradeDatabase(int to_version) {
     } else {
       db_version = ret.get();
     }
+  } else {
+    LOG(INFO) << "Failed to obtain database version. Assume version '"
+              << std::to_string(db_version) << "' and migrate.";
   }
 
   while (db_version != to_version) {

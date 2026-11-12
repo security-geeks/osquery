@@ -9,14 +9,19 @@ schema([
     Column("description", TEXT, "Optional user description"),
     Column("directory", TEXT, "User's home directory"),
     Column("shell", TEXT, "User's configured default shell"),
-    Column("uuid", TEXT, "User's UUID (Apple) or SID (Windows)", index=True),
+    Column("uuid", TEXT, "User's UUID (Apple) or SID (Windows)", index=True, collate="nocase"),
 ])
 extended_schema(WINDOWS, [
     Column("type", TEXT, "Whether the account is roaming (domain), local, or a system profile"),
 ])
-
 extended_schema(DARWIN, [
     Column("is_hidden", INTEGER, "IsHidden attribute set in OpenDirectory")
+])
+extended_schema(LINUX, [
+    Column("pid_with_namespace", INTEGER, "Pids that contain a namespace", additional=True, hidden=True),
+])
+extended_schema(LINUX, [
+    Column("include_remote", INTEGER, "1 to include remote (LDAP/AD) accounts (default 0). Warning: without any uid/username filtering it may list whole LDAP directories", additional=True, hidden=True),
 ])
 implementation("users@genUsers")
 examples([

@@ -38,9 +38,9 @@ TEST_F(WindowsEventLogTests, parse_wel_xml) {
       "<Data>10.0.19041.1</Data><Data>e7caee08</Data>"
       "<Data>c0000005</Data><Data>00000000000c265c</Data>"
       "<Data>b04</Data><Data>01d6750999d2deee</Data>"
-      "<Data>C:\Users\Administrator\Documents\wel_table\osquery-"
-      "wel\build\osquery\Debug\osqueryi.exe</Data>"
-      "<Data>C:\Windows\SYSTEM32\ucrtbased.dll</Data>"
+      "<Data>C:\\Users\\Administrator\\Documents\\wel_table\\osquery-"
+      "wel\\build\\osquery\\Debug\\osqueryi.exe</Data>"
+      "<Data>C:\\Windows\\SYSTEM32\\ucrtbased.dll</Data>"
       "<Data>3bcbd6a4-60e5-4474-be94-90c7a987d03b</Data>"
       "<Data></Data><Data></Data></EventData></Event>";
 
@@ -52,14 +52,16 @@ TEST_F(WindowsEventLogTests, parse_wel_xml) {
   Row row;
   parseWelXml(context, stringToWstring(xml_event), row);
 
+  /* NOTE: The escaping of the backslash doesn't match the original xml event
+     because JSON is also escaping the backslash, so there are two levels. */
   std::string expect_data =
       "{\"EventData\":[\"osqueryi.exe\",\"4.4.0.0\",\"5f3b4065\",\"ucrtbased."
       "dll\",\"10.0.19041.1\",\"e7caee08\",\"c0000005\",\"00000000000c265c\","
       "\"b04\",\"01d6750999d2deee\","
-      "\"C:UsersAdministratorDocumentswel_tableosquery-wel\\"
-      "buildosqueryDebugosqueryi.exe\","
-      "\"C:WindowsSYSTEM32ucrtbased.dll\",\"3bcbd6a4-60e5-4474-be94-"
-      "90c7a987d03b\",\"\",\"\"]}";
+      "\"C:\\\\Users\\\\Administrator\\\\Documents\\\\wel_table\\\\osquery-"
+      "wel\\\\build\\\\osquery\\\\Debug\\\\osqueryi.exe\","
+      "\"C:\\\\Windows\\\\SYSTEM32\\\\ucrtbased.dll\",\"3bcbd6a4-60e5-4474-"
+      "be94-90c7a987d03b\",\"\",\"\"]}";
 
   EXPECT_EQ(row["datetime"], "2020-08-18T02:45:18.854092300Z");
   EXPECT_EQ(row["channel"], "Application");
@@ -72,6 +74,33 @@ TEST_F(WindowsEventLogTests, parse_wel_xml) {
   EXPECT_EQ(row["pid"], "-1");
   EXPECT_EQ(row["tid"], "-1");
   EXPECT_EQ(row["data"], expect_data);
+}
+
+TEST_F(WindowsEventLogTests, parse_wel_xml_fails) {
+  std::string xml_event =
+      "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+      "<System>"
+      "<Provider Name='Microsoft-Windows-Security-Auditing' "
+      "Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}' EventSourceName='' />"
+      "<EventID>1234</EventID>"
+      "<Version>0</Version>"
+      "<Level>0</Level>"
+      "<Task>13569</Task>"
+      "<Opcode>0</Opcode>"
+      "<Keywords>0x8020000000000000</Keywords>"
+      "<TimeCreated SystemTime='2021-07-09T17:42:21.9876643Z' />"
+      "<EventRecordID>203</EventRecordID>"
+      "<Correlation ActivityID='{5afc5725-7524-0001-8857-fc5a2475d701}' />"
+      "<Execution ProcessID='624' ThreadID='728' />"
+      "<Channel>Security</Channel>"
+      "<Computer>DESKTOP-HFR8AR9</Computer>"
+      "<Security /></System></Event>";
+
+  QueryContext context;
+
+  Row row;
+  ASSERT_NO_THROW(parseWelXml(context, stringToWstring(xml_event), row));
+  EXPECT_TRUE(row.empty());
 }
 
 TEST_F(WindowsEventLogTests, gen_xfilter_test1) {

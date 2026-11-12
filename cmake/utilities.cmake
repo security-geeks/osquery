@@ -214,6 +214,15 @@ function(add_osquery_executable)
 
   add_executable(${osquery_exe_name} ${osquery_exe_args})
 
+  if(DEFINED PLATFORM_MACOS)
+    getCleanedOsqueryVersion("OSQUERY_PLIST_VERSION")
+
+    configure_file(
+      "${CMAKE_SOURCE_DIR}/tools/deployment/macos_packaging/Info.plist.in"
+      "${CMAKE_BINARY_DIR}/tools/deployment/macos_packaging/Info.plist"
+    )
+  endif()
+
   if(DEFINED PLATFORM_WINDOWS)
     set(OSQUERY_MANIFEST_TARGET_NAME "${osquery_exe_name}")
 
@@ -254,6 +263,29 @@ function(add_osquery_library)
   endforeach()
 
   add_library(${osquery_lib_name} ${osquery_lib_args})
+
+  # Apply precompiled headers to every real (compiled) osquery library.
+  # INTERFACE and IMPORTED targets are excluded because they have no compile
+  # step of their own.  UNKNOWN is also excluded (foreign imported libs).
+  #
+  # We compile separate PCH artifacts for CXX and OBJCXX via
+  # $<COMPILE_LANGUAGE:> generator expressions so that .mm translation units
+  # get an Objective-C++-aware PCH while regular .cpp files keep the C++ PCH.
+  if(NOT "INTERFACE" IN_LIST osquery_lib_ARGN AND
+     NOT "IMPORTED"  IN_LIST osquery_lib_ARGN AND
+     NOT "UNKNOWN"   IN_LIST osquery_lib_ARGN)
+    set(_osquery_pch "${CMAKE_SOURCE_DIR}/cmake/osquery_pch.h")
+    if(DEFINED PLATFORM_MACOS)
+      target_precompile_headers(${osquery_lib_name} PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:${_osquery_pch}>"
+        "$<$<COMPILE_LANGUAGE:OBJCXX>:${_osquery_pch}>"
+      )
+    else()
+      target_precompile_headers(${osquery_lib_name} PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:${_osquery_pch}>"
+      )
+    endif()
+  endif()
 endfunction()
 
 # This function modifies an existing cache variable but without changing its description
@@ -274,6 +306,13 @@ function(generateSpecialTargets)
     "libraries"
   )
 
+  add_custom_target(format
+    COMMAND "${OSQUERY_PYTHON_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/tools/formatting/git-clang-format.py"
+            --exclude-folders "${excluded_folders}" --binary "${OSQUERY_CLANG_FORMAT}" -f --style=file
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    VERBATIM
+  )
   add_custom_target(format_check
     COMMAND "${OSQUERY_PYTHON_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/tools/formatting/format-check.py"
@@ -281,10 +320,10 @@ function(generateSpecialTargets)
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     VERBATIM
   )
-  add_custom_target(format
+  add_custom_target(format_all
     COMMAND "${OSQUERY_PYTHON_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/tools/formatting/git-clang-format.py"
-            --exclude-folders "${excluded_folders}" --binary "${OSQUERY_CLANG_FORMAT}" -f --style=file
+            --exclude-folders "${excluded_folders}" --binary "${OSQUERY_CLANG_FORMAT}" -f --style=file origin/master
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     VERBATIM
   )
@@ -460,4 +499,72 @@ function(findClangFormat)
   if(NOT "${OSQUERY_CLANG_FORMAT}" STREQUAL "OSQUERY_CLANG_FORMAT-NOTFOUND")
     message(STATUS "Found clang-format: ${OSQUERY_CLANG_FORMAT}")
   endif()
+endfunction()
+
+function(detectMSVCToolsetVersion)
+  set(error_message_missing_toolset "Could not detect the MSVC toolset version. Some build functionality may be disabled")
+
+  if(CMAKE_GENERATOR MATCHES "Visual Studio")
+    if(MSVC_TOOLSET_VERSION STREQUAL "")
+      message(WARNING "${error_message_missing_toolset}")
+      return()
+    endif()
+
+    set(detectMSVCToolsetVersion_OUTPUT ${MSVC_TOOLSET_VERSION} PARENT_SCOPE)
+  elseif(CMAKE_GENERATOR STREQUAL "Ninja")
+    set(raw_toolset_version "$ENV{VCToolsVersion}")
+
+    if(raw_toolset_version STREQUAL "")
+      message(WARNING "${error_message_missing_toolset}")
+      return()
+    endif()
+
+    string(REPLACE "." "" cleaned_toolset_version ${raw_toolset_version})
+    string(SUBSTRING "${cleaned_toolset_version}" 0 3 cleaned_toolset_version)
+
+    if(cleaned_toolset_version STREQUAL "" OR NOT cleaned_toolset_version MATCHES "[0-9][0-9][0-9]")
+      message(WARNING "Could not extract MSVC toolset version from ${raw_toolset_version}. Some build functionality may be disabled")
+      return()
+    endif()
+
+    set(detectMSVCToolsetVersion_OUTPUT ${cleaned_toolset_version} PARENT_SCOPE)
+  else()
+    message(WARNING "Unsupported generator to detect the MSVC toolset version. Some build functionality may be disabled")
+  endif()
+endfunction()
+
+# Like add_dependencies but if an INTERFACE library is passed,
+# it will drill down to the non INTERFACE target and add a dependency to that.
+function(add_real_target_dependencies target root_target_dependency)
+  set(targets_to_process ${root_target_dependency})
+
+  while(true)
+    list(LENGTH targets_to_process targets_to_process_length)
+
+    if(targets_to_process_length EQUAL 0)
+      break()
+    endif()
+
+    list(POP_FRONT targets_to_process current_target)
+
+    get_target_property(thirdparty_target_type ${current_target} TYPE)
+
+    # If it's not an interface library, we have arrived at our needed target
+    if(NOT thirdparty_target_type STREQUAL "INTERFACE_LIBRARY")
+      add_dependencies(${target} ${current_target})
+    else()
+      # Otherwise get all the public dependencies and add them to be processed
+      get_target_property(thirdparty_dependency_list
+        ${current_target}
+        INTERFACE_LINK_LIBRARIES
+      )
+
+      if(thirdparty_dependency_list STREQUAL "thirdparty_dependency_list-NOTFOUND")
+        continue()
+      endif()
+
+      list(APPEND targets_to_process ${thirdparty_dependency_list})
+      list(REMOVE_DUPLICATES targets_to_process)
+    endif()
+  endwhile()
 endfunction()

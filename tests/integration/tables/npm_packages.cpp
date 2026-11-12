@@ -30,10 +30,12 @@ TEST_F(NpmPackagesTest, test_sanity) {
       {"name", NonEmptyString},
       {"version", NonEmptyString},
       {"description", NormalType},
+      {"homepage", NormalType},
       {"author", NormalType},
       {"license", NormalType},
       {"path", NonEmptyString},
       {"directory", NonEmptyString},
+      {"depth", IntType},
   };
 
   validate_rows(data, row_map);

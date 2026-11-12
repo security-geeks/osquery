@@ -34,6 +34,21 @@ function(pluginsLoggerMain)
   generatePluginsLoggerSyslog()
   generatePluginsLoggerTlslogger()
   generatePluginsLoggerWindowseventlog()
+
+  if(OSQUERY_BUILD_TESTS)
+    add_test(NAME plugins_logger_tests_mergedtests-test COMMAND plugins_logger_tests_mergedtests-test)
+
+    set(plugins_logger_tests_mergedtests-test_env
+      "TEST_CONF_FILES_DIR=${TEST_CONFIGS_DIR}"
+      "TEST_HELPER_SCRIPTS_DIR=${CMAKE_BINARY_DIR}/tools/tests"
+      "OSQUERY_PYTHON_INTERPRETER_PATH=${OSQUERY_PYTHON_EXECUTABLE}"
+    )
+
+    set_tests_properties(
+      plugins_logger_tests_mergedtests-test
+      PROPERTIES ENVIRONMENT "${plugins_logger_tests_mergedtests-test_env}"
+    )
+  endif()
 endfunction()
 
 function(generatePluginsLoggerAwsfirehose)
@@ -47,8 +62,7 @@ function(generatePluginsLoggerAwsfirehose)
     osquery_cxx_settings
     osquery_dispatcher
     plugins_logger_awslogforwarder
-    thirdparty_aws_core
-    thirdparty_aws_firehose
+    thirdparty_aws-cpp-sdk-firehose
   )
 
   set(public_header_files
@@ -71,8 +85,7 @@ function(generatePluginsLoggerAwskinesis)
     osquery_process
     osquery_registry
     plugins_logger_awslogforwarder
-    thirdparty_aws_core
-    thirdparty_aws_kinesis
+    thirdparty_aws-cpp-sdk-kinesis
   )
 
   set(public_header_files
@@ -80,7 +93,6 @@ function(generatePluginsLoggerAwskinesis)
   )
 
   generateIncludeNamespace(plugins_logger_awskinesis "plugins/logger" "FILE_ONLY" ${public_header_files})
-  add_test(NAME plugins_logger_tests_awskinesisloggertests-test COMMAND plugins_logger_tests_awskinesisloggertests-test)
 endfunction()
 
 function(generatePluginsLoggerAwslogforwarder)
@@ -120,7 +132,6 @@ function(generatePluginsLoggerBuffered)
   )
 
   generateIncludeNamespace(plugins_logger_buffered "plugins/logger" "FILE_ONLY" ${public_header_files})
-  add_test(NAME plugins_logger_tests_bufferedloggertests-test COMMAND plugins_logger_tests_bufferedloggertests-test)
 endfunction()
 
 function(generatePluginsLoggerFilesystemlogger)
@@ -135,6 +146,7 @@ function(generatePluginsLoggerFilesystemlogger)
     plugins_logger_commondeps
     osquery_filesystem
     osquery_utils_config
+    osquery_utils_conversions
   )
 
   set(public_header_files
@@ -142,7 +154,6 @@ function(generatePluginsLoggerFilesystemlogger)
   )
 
   generateIncludeNamespace(plugins_logger_filesystemlogger "plugins/logger" "FILE_ONLY" ${public_header_files})
-  add_test(NAME plugins_logger_tests_filesystemloggertests-test COMMAND plugins_logger_tests_filesystemloggertests-test)
 endfunction()
 
 function(generatePluginsLoggerKafkaproducer)
@@ -169,7 +180,6 @@ function(generatePluginsLoggerKafkaproducer)
   )
 
   generateIncludeNamespace(plugins_logger_kafkaproducer "plugins/logger" "FILE_ONLY" ${public_header_files})
-  add_test(NAME plugins_logger_tests_kafkaproducerloggertests-test COMMAND plugins_logger_tests_kafkaproducerloggertests-test)
 endfunction()
 
 function(generatePluginsLoggerStdout)
@@ -208,13 +218,6 @@ function(generatePluginsLoggerSyslog)
     set(public_header_files syslog_logger.h)
 
     generateIncludeNamespace(plugins_logger_syslog "plugins/logger" "FILE_ONLY" ${public_header_files})
-
-    add_test(NAME plugins_logger_tests_syslogloggertests-test COMMAND plugins_logger_tests_syslogloggertests-test)
-
-    set_tests_properties(
-      plugins_logger_tests_syslogloggertests-test
-      PROPERTIES ENVIRONMENT "TEST_CONF_FILES_DIR=${TEST_CONFIGS_DIR}"
-    )
   else()
      add_osquery_library(plugins_logger_syslog INTERFACE)
   endif()
@@ -242,20 +245,6 @@ function(generatePluginsLoggerTlslogger)
   )
 
   generateIncludeNamespace(plugins_logger_tlslogger "plugins/logger" "FILE_ONLY" ${public_header_files})
-
-  add_test(NAME plugins_logger_tests_tlsloggertests-test COMMAND plugins_logger_tests_tlsloggertests-test)
-
-  set(tlsloggertests-test_env
-    "TEST_CONF_FILES_DIR=${TEST_CONFIGS_DIR}"
-    "TEST_HELPER_SCRIPTS_DIR=${CMAKE_BINARY_DIR}/tools/tests"
-    "OSQUERY_PYTHON_INTERPRETER_PATH=${OSQUERY_PYTHON_EXECUTABLE}"
-  )
-
-  set_tests_properties(
-    plugins_logger_tests_tlsloggertests-test
-    PROPERTIES ENVIRONMENT "${tlsloggertests-test_env}"
-  )
-
 endfunction()
 
 function(generatePluginsLoggerWindowseventlog)

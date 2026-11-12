@@ -31,8 +31,11 @@ const std::string kWin10CreatorStart = "34";
 const std::string kWin8110ShimcacheDelimiter = "31307473";
 
 // Shimcache can be in multiple ControlSets (ControlSet001, ControlSet002, etc)
+// We are only going to check CurrentControlSet, which is symlinked to the
+// active ControlSet
+
 const std::string kShimcacheControlset =
-    "HKEY_LOCAL_MACHINE\\SYSTEM\\%ControlSet%\\Control\\Session "
+    "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session "
     "Manager\\AppCompatCache";
 
 struct ShimcacheData {
@@ -100,7 +103,7 @@ auto parseShimcacheData(const std::string& token,
       shimcache_modified_start + (size_t)shimcache_file_path * 2, 16);
 
   // Sometimes Shimcache artifacts have 0 as timestamp, if so skip filetime
-  // converstion
+  // conversion
   shimcache.last_modified = (shimcache_time == "0000000000000000")
                                 ? 0LL
                                 : littleEndianToUnixTime(shimcache_time);

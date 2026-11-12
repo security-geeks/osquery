@@ -22,7 +22,14 @@
 
 namespace osquery {
 
-HIDDEN_FLAG(bool, registry_exceptions, false, "Allow plugin exceptions");
+/* NOTE: the default is false, because it's easier to enable it in one place
+   when starting osquery, instead of having each test enable them,
+   so that they are seen and fixed. */
+HIDDEN_FLAG(bool,
+            ignore_registry_exceptions,
+            false,
+            "Ignore exceptions thrown by the registry. osquery and extensions "
+            "default to true.");
 
 RegistryFactory& RegistryFactory::get() {
   static RegistryFactory instance;
@@ -82,7 +89,9 @@ Status RegistryFactory::addBroadcast(const RouteUUID& uuid,
           VLOG(1) << "Extension " << uuid
                   << " has duplicate plugin name: " << item.first
                   << " in registry: " << registry.first;
-          return Status(1, "Duplicate registry item: " + item.first);
+          return Status(1,
+                        "Registry item " + item.first +
+                            " conflicts with another item of the same name.");
         }
       }
     }
@@ -124,9 +133,14 @@ Status RegistryFactory::addBroadcast(const RouteUUID& uuid,
 }
 
 Status RegistryFactory::removeBroadcast(const RouteUUID& uuid) {
+  // Claim the uuid by erasing it under the write lock so exactly one remover
+  // (the Thrift deregister or the watcher reap) runs the teardown; the other
+  // no-ops. Defense-in-depth: the deadlock itself is broken by removeExternal
+  // not holding the registry lock across its callback (registry_interface.cpp).
+  // On its own this change only prevents a redundant double DROP of the tables.
   {
-    ReadLock lock(mutex_);
-    if (extensions_.count(uuid) == 0) {
+    WriteLock lock(mutex_);
+    if (extensions_.erase(uuid) == 0) {
       return Status(1, "Unknown extension UUID: " + std::to_string(uuid));
     }
   }
@@ -135,8 +149,6 @@ Status RegistryFactory::removeBroadcast(const RouteUUID& uuid) {
     registry.second->removeExternal(uuid);
   }
 
-  WriteLock lock(mutex_);
-  extensions_.erase(uuid);
   return Status::success();
 }
 
@@ -178,14 +190,14 @@ Status RegistryFactory::call(const std::string& registry_name,
   } catch (const std::exception& e) {
     LOG(ERROR) << registry_name << " registry " << item_name
                << " plugin caused exception: " << e.what();
-    if (FLAGS_registry_exceptions) {
+    if (!FLAGS_ignore_registry_exceptions) {
       throw;
     }
     return Status(1, e.what());
   } catch (...) {
     LOG(ERROR) << registry_name << " registry " << item_name
                << " plugin caused unknown exception";
-    if (FLAGS_registry_exceptions) {
+    if (!FLAGS_ignore_registry_exceptions) {
       throw std::runtime_error(registry_name + ": " + item_name + " failed");
     }
     return Status(2, "Unknown exception");

@@ -38,6 +38,10 @@ QueryData genLoggedInUsers(QueryContext& context) {
   QueryData results;
   struct utmpx* entry = nullptr;
 
+  // switch to the utmp file, and reset to the first entry
+  utmpxname(_PATH_UTMPX);
+  setutxent();
+
   while ((entry = getutxent()) != nullptr) {
     if (entry->ut_pid == 1) {
       continue;
@@ -48,9 +52,9 @@ QueryData genLoggedInUsers(QueryContext& context) {
     } else {
       r["type"] = kLoginTypes.at(entry->ut_type);
     }
-    r["user"] = TEXT(entry->ut_user);
-    r["tty"] = TEXT(entry->ut_line);
-    r["host"] = TEXT(entry->ut_host);
+    r["user"] = SQL_TEXT(entry->ut_user);
+    r["tty"] = SQL_TEXT(entry->ut_line);
+    r["host"] = SQL_TEXT(entry->ut_host);
     r["time"] = INTEGER(entry->ut_tv.tv_sec);
     r["pid"] = INTEGER(entry->ut_pid);
     results.push_back(r);
@@ -59,5 +63,5 @@ QueryData genLoggedInUsers(QueryContext& context) {
 
   return results;
 }
-}
-}
+} // namespace tables
+} // namespace osquery

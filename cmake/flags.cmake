@@ -1,11 +1,15 @@
-if(NOT DEFINED OSQUERY_TOOLCHAIN_SYSROOT)
+
+if(DEFINED PLATFORM_POSIX)
+  if(DEFINED PLATFORM_LINUX)
     include(CheckPIESupported)
     check_pie_supported()
-    if(NOT CMAKE_C_LINK_PIE_SUPPORT OR NOT CMAKE_CXX_LINK_PIE_SUPPORT)
-        message(FATAL_ERROR "The linker for the current compiler do not support -fPIE or -pie")
+    if(NOT CMAKE_C_LINK_PIE_SUPPORTED OR NOT CMAKE_CXX_LINK_PIE_SUPPORTED)
+        message(FATAL_ERROR "The linker for the current compiler does not support -fPIE or -pie")
     endif()
+  endif()
+
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -22,6 +26,12 @@ function(setupBuildFlags)
   add_library(c_settings INTERFACE)
 
   target_compile_features(cxx_settings INTERFACE cxx_std_17)
+
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(cxx_settings INTERFACE
+      "SHELL:-Xclang -fno-pch-timestamp"
+    )
+  endif()
 
   # There's no specific C11 conformance on MSVC
   # and recent versions of CMake add the /std:c11 flag to the command line
@@ -67,6 +77,15 @@ function(setupBuildFlags)
 
     if(NOT "${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
       list(APPEND posix_common_compile_options INTERFACE -Oz)
+
+      # Fortified libc calls require optimization, so they are not enabled in
+      # Debug builds. Undefine first to override any default level (the macOS
+      # SDK defaults to 2) without a redefinition warning. C libraries that do
+      # not support level 3 (macOS, older glibc) treat it as level 2.
+      list(APPEND posix_common_compile_options
+        -U_FORTIFY_SOURCE
+        -D_FORTIFY_SOURCE=3
+      )
     endif()
 
     set(osquery_posix_common_defines
@@ -74,22 +93,58 @@ function(setupBuildFlags)
       OSQUERY_POSIX=1
     )
 
+    set(posix_common_link_options)
+    set(posix_common_defines)
+
     set(posix_cxx_compile_options
       -Wno-c++11-extensions
       -Woverloaded-virtual
       -Wnon-virtual-dtor
       -Weffc++
-      -stdlib=libc++
     )
 
     set(posix_cxx_link_options
-      -stdlib=libc++
       -ldl
     )
 
     set(posix_c_compile_options
       -Wno-c99-extensions
     )
+
+    if(OSQUERY_ENABLE_ADDRESS_SANITIZER)
+      list(APPEND posix_common_compile_options
+        -fsanitize=address
+      )
+      list(APPEND posix_common_link_options
+        -fsanitize=address
+      )
+    endif()
+
+    if(OSQUERY_ENABLE_THREAD_SANITIZER)
+      list(APPEND posix_common_compile_options
+        -fsanitize=thread
+      )
+
+      list(APPEND posix_common_link_options
+        -fsanitize=thread
+      )
+    endif()
+
+    if(OSQUERY_ENABLE_LEAK_SANITIZER)
+      list(APPEND posix_common_compile_options
+        -fsanitize=leak
+      )
+      list(APPEND posix_common_link_options
+        -fsanitize=leak
+      )
+    endif()
+
+    if(OSQUERY_ENABLE_ADDRESS_SANITIZER OR OSQUERY_ENABLE_THREAD_SANITIZER OR OSQUERY_ENABLE_LEAK_SANITIZER)
+      # Get more precise stack traces
+      list(APPEND posix_common_compile_options
+        -fno-omit-frame-pointer
+      )
+    endif()
 
     target_compile_options(cxx_settings INTERFACE
       ${posix_common_compile_options}
@@ -108,21 +163,38 @@ function(setupBuildFlags)
       ${posix_c_compile_options}
     )
 
-    list(APPEND osquery_defines ${osquery_posix_common_defines})
+    target_link_options(c_settings INTERFACE
+      ${posix_common_link_options}
+    )
 
+    list(APPEND osquery_defines
+      ${osquery_posix_common_defines}
+      ${posix_common_defines}
+    )
 
     if(DEFINED PLATFORM_LINUX)
       set(osquery_linux_common_defines
         LINUX=1
         OSQUERY_LINUX=1
-        OSQUERY_BUILD_DISTRO=centos7
-        OSQUERY_BUILD_PLATFORM=linux
+        OSQUERY_BUILD_DISTRO="centos7"
+        OSQUERY_BUILD_PLATFORM="linux"
       )
 
       set(osquery_linux_common_link_options
         -Wl,-z,relro,-z,now
         -Wl,--build-id=sha1
+        -Wl,--gc-sections
       )
+
+      set(linux_common_compile_options)
+
+      # Control-flow integrity: Intel CET (IBT and shadow stack) on x86_64,
+      # and PAC/BTI on aarch64.
+      if("${TARGET_PROCESSOR}" STREQUAL "x86_64")
+        list(APPEND linux_common_compile_options -fcf-protection=full)
+      elseif("${TARGET_PROCESSOR}" STREQUAL "aarch64")
+        list(APPEND linux_common_compile_options -mbranch-protection=standard)
+      endif()
 
       set(linux_cxx_link_options
         --no-undefined
@@ -131,27 +203,48 @@ function(setupBuildFlags)
       )
 
       set(linux_cxx_link_libraries
-        c++abi
         rt
         dl
       )
 
-      list(APPEND osquery_defines ${osquery_linux_common_defines})
+      if(OSQUERY_BUILD_FUZZERS)
+        list(APPEND linux_common_compile_options
+          -fsanitize=fuzzer-no-link
+          -fsanitize-coverage=edge,indirect-calls
+        )
+
+        list(APPEND osquery_linux_common_defines
+          OSQUERY_IS_FUZZING
+        )
+      endif()
+
+      list(APPEND osquery_defines
+        ${osquery_linux_common_defines}
+      )
+
+      target_compile_options(cxx_settings INTERFACE
+        ${linux_common_compile_options}
+      )
+
       target_link_options(cxx_settings INTERFACE
         ${osquery_linux_common_link_options}
         ${linux_cxx_link_options}
+      )
+
+      target_link_libraries(cxx_settings INTERFACE
+        ${linux_cxx_link_libraries}
+      )
+
+      target_compile_options(c_settings INTERFACE
+        ${linux_common_compile_options}
       )
 
       target_link_options(c_settings INTERFACE
         ${osquery_linux_common_link_options}
       )
 
-      target_link_libraries(cxx_settings INTERFACE
-        ${linux_cxx_link_libraries}
-      )
     elseif(DEFINED PLATFORM_MACOS)
       set(macos_cxx_compile_options
-        -x objective-c++
         -fobjc-arc
         -Wabi-tag
       )
@@ -159,6 +252,9 @@ function(setupBuildFlags)
       set(macos_cxx_link_options
         -stdlib=libc++
         -lresolv
+        -Wl,-dead_strip
+        # Release builds carry no debug info, so drop the local symbols too
+        "$<$<CONFIG:Release>:-Wl,-x>"
       )
 
       set(macos_cxx_link_libraries
@@ -180,14 +276,16 @@ function(setupBuildFlags)
         "-framework Security"
         "-framework ServiceManagement"
         "-framework SystemConfiguration"
+        "-weak_framework OSLog"
       )
 
       set(osquery_macos_common_defines
         APPLE=1
         DARWIN=1
         BSD=1
-        OSQUERY_BUILD_PLATFORM=darwin
-        OSQUERY_BUILD_DISTRO=10.12
+        OSQUERY_DARWIN=1
+        OSQUERY_BUILD_PLATFORM="darwin"
+        OSQUERY_BUILD_DISTRO="10.14"
       )
 
       target_compile_options(cxx_settings INTERFACE
@@ -211,53 +309,6 @@ function(setupBuildFlags)
       target_compile_options(cxx_settings INTERFACE -g0)
       target_compile_options(c_settings INTERFACE -g0)
     endif()
-
-    if(OSQUERY_BUILD_FUZZERS)
-      if(OSQUERY_ENABLE_ADDRESS_SANITIZER)
-        target_compile_options(cxx_settings INTERFACE
-          -fsanitize=address,fuzzer-no-link
-          -fsanitize-coverage=edge,indirect-calls
-        )
-        target_compile_options(c_settings INTERFACE
-          -fsanitize=address,fuzzer-no-link
-          -fsanitize-coverage=edge,indirect-calls
-        )
-
-        # Require at least address (may be refactored out)
-        target_link_options(cxx_settings INTERFACE
-          -fsanitize=address
-        )
-        target_link_options(c_settings INTERFACE
-          -fsanitize=address
-        )
-      endif()
-
-      list(APPEND osquery_defines
-        OSQUERY_IS_FUZZING
-      )
-
-      target_compile_options(cxx_settings INTERFACE
-        -fno-omit-frame-pointer
-      )
-      target_compile_options(c_settings INTERFACE
-        -fno-omit-frame-pointer
-      )
-    elseif(OSQUERY_ENABLE_ADDRESS_SANITIZER)
-      target_compile_options(cxx_settings INTERFACE
-        -fsanitize=address
-      )
-      target_compile_options(c_settings INTERFACE
-        -fsanitize=address
-      )
-
-      # Require at least address (may be refactored out)
-      target_link_options(cxx_settings INTERFACE
-        -fsanitize=address
-      )
-      target_link_options(c_settings INTERFACE
-        -fsanitize=address
-      )
-    endif()
   elseif(DEFINED PLATFORM_WINDOWS)
 
     set(windows_common_compile_options
@@ -269,7 +320,6 @@ function(setupBuildFlags)
 
     set(osquery_windows_compile_options
       /W3
-      "$<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/Z7>"
     )
 
     set(windows_common_link_options
@@ -299,7 +349,23 @@ function(setupBuildFlags)
       shell32.lib
       gdi32.lib
       mswsock.lib
+      comsuppw.lib
+      SearchSDK.lib
     )
+
+    # Exploit mitigations. ASLR (with high-entropy 64-bit addresses) and DEP
+    # are linker defaults, but are stated explicitly so they cannot be dropped
+    # silently. Control Flow Guard must be given to the linker as well as the
+    # compiler to take effect.
+    list(APPEND windows_common_link_options
+      /DYNAMICBASE
+      /HIGHENTROPYVA
+      /NXCOMPAT
+      /guard:cf
+    )
+
+    # /CETCOMPAT (CET shadow stacks) is not enabled: on x64, Boost.Context uses
+    # the fcontext backend, whose stack switching violates the shadow stack.
 
     if(OSQUERY_ENABLE_INCREMENTAL_LINKING)
       list(APPEND windows_common_link_options
@@ -316,8 +382,8 @@ function(setupBuildFlags)
       WINDOWS=1
       WIN32_LEAN_AND_MEAN
       OSQUERY_WINDOWS=1
-      OSQUERY_BUILD_PLATFORM=windows
-      OSQUERY_BUILD_DISTRO=10
+      OSQUERY_BUILD_PLATFORM="windows"
+      OSQUERY_BUILD_DISTRO="10"
       BOOST_CONFIG_SUPPRESS_OUTDATED_MESSAGE=1
       UNICODE
       _UNICODE
@@ -327,6 +393,9 @@ function(setupBuildFlags)
       "$<$<NOT:$<CONFIG:Debug>>:NDEBUG>"
       _WIN32_WINNT=_WIN32_WINNT_WIN7
       NTDDI_VERSION=NTDDI_WIN7
+      # VS2022 warns about this; the AWS SDK uses this non standard extension.
+      # Updating the SDK and switching to C++20 should fix this.
+      _SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING
     )
 
     set(windows_cxx_compile_options
@@ -337,6 +406,22 @@ function(setupBuildFlags)
       BOOST_ALL_NO_LIB
       BOOST_ALL_STATIC_LINK
     )
+
+    if(OSQUERY_BUILD_FUZZERS)
+      list(APPEND windows_common_compile_options
+        /fsanitize=fuzzer
+      )
+
+      list(APPEND osquery_windows_common_defines
+        OSQUERY_IS_FUZZING
+      )
+    endif()
+
+    if(OSQUERY_ENABLE_ADDRESS_SANITIZER)
+      list(APPEND windows_common_compile_options
+        /fsanitize=address
+      )
+    endif()
 
     target_compile_options(cxx_settings INTERFACE
       ${windows_common_compile_options}
@@ -368,9 +453,6 @@ function(setupBuildFlags)
     string(REPLACE "/MD" "/MT" CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
     string(REPLACE "/MD" "/MT" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
     string(REPLACE "/MD" "/MT" CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
-
-    string(REPLACE "/Zi" "" CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
-    string(REPLACE "/Zi" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
 
     string(REPLACE "/EHsc" "/EHs" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 

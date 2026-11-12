@@ -7,8 +7,7 @@
 
 function(osqueryUtilsConversionsMain)
   if(OSQUERY_BUILD_TESTS)
-    generateOsqueryUtilsConversionsConversionstestsTest()
-    generateOsqueryUtilsConversionsTotestsTest()
+    generateOsqueryUtilsConversionsMergedtestsTest()
   endif()
 
   generateOsqueryUtilsConversions()
@@ -19,11 +18,13 @@ function(generateOsqueryUtilsConversions)
   set(source_files
     split.cpp
     tryto.cpp
+    trim.cpp
   )
 
   if(DEFINED PLATFORM_MACOS)
     list(APPEND source_files
       darwin/cfdata.cpp
+      darwin/cfdictionary.mm
       darwin/cfnumber.cpp
       darwin/cfstring.cpp
       darwin/cftime.cpp
@@ -57,6 +58,7 @@ function(generateOsqueryUtilsConversions)
     join.h
     split.h
     tryto.h
+    trim.h
   )
 
   generateIncludeNamespace(osquery_utils_conversions "osquery/utils/conversions" "FILE_ONLY" ${public_header_files})
@@ -64,6 +66,7 @@ function(generateOsqueryUtilsConversions)
   if(DEFINED PLATFORM_MACOS)
     set(platform_public_header_files
       darwin/cfdata.h
+      darwin/cfdictionary.h
       darwin/cfnumber.h
       darwin/cfstring.h
       darwin/cftime.h
@@ -78,11 +81,12 @@ function(generateOsqueryUtilsConversions)
   endif()
 
   list(LENGTH platform_public_header_files platform_public_header_files_size)
+
   if(${platform_public_header_files_size} GREATER 0)
     generateIncludeNamespace(osquery_utils_conversions "osquery/utils/conversions" "FULL_PATH" ${platform_public_header_files})
   endif()
 
-  add_test(NAME osquery_utils_conversions_conversionstests-test COMMAND osquery_utils_conversions_conversionstests-test)
+  add_test(NAME osquery_utils_conversions_mergedtests-test COMMAND osquery_utils_conversions_mergedtests-test)
 endfunction()
 
 function(generateOsqueryUtilsConversionsTo)
@@ -95,20 +99,21 @@ function(generateOsqueryUtilsConversionsTo)
   target_link_libraries(osquery_utils_conversions_to INTERFACE thirdparty_boost)
 
   generateIncludeNamespace(osquery_utils_conversions_to "osquery/utils/conversions" "FILE_ONLY" ${public_header_files})
-
-  add_test(NAME osquery_utils_conversions_totests-test COMMAND osquery_utils_conversions_totests-test)
 endfunction()
 
-function(generateOsqueryUtilsConversionsConversionstestsTest)
+function(generateOsqueryUtilsConversionsMergedtestsTest)
   set(source_files
     tests/join.cpp
     tests/split.cpp
     tests/tryto.cpp
+    tests/trim.cpp
+    tests/to.cpp
   )
 
   if(DEFINED PLATFORM_MACOS)
     list(APPEND source_files
       darwin/tests/cfstring.cpp
+      darwin/tests/cfdictionary.cpp
     )
   elseif(DEFINED PLATFORM_WINDOWS)
     list(APPEND source_files
@@ -117,21 +122,11 @@ function(generateOsqueryUtilsConversionsConversionstestsTest)
     )
   endif()
 
-  add_osquery_executable(osquery_utils_conversions_conversionstests-test ${source_files})
+  add_osquery_executable(osquery_utils_conversions_mergedtests-test ${source_files})
 
-  target_link_libraries(osquery_utils_conversions_conversionstests-test PRIVATE
+  target_link_libraries(osquery_utils_conversions_mergedtests-test PRIVATE
     osquery_cxx_settings
     osquery_utils_conversions
-    thirdparty_googletest
-  )
-endfunction()
-
-function(generateOsqueryUtilsConversionsTotestsTest)
-
-  add_osquery_executable(osquery_utils_conversions_totests-test tests/to.cpp)
-
-  target_link_libraries(osquery_utils_conversions_totests-test PRIVATE
-    osquery_cxx_settings
     osquery_utils_conversions_to
     thirdparty_googletest
   )

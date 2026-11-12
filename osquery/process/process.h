@@ -111,6 +111,8 @@ class PlatformProcess : private boost::noncopyable {
    */
   bool killGracefully() const;
 
+  virtual void warnResourceLimitHit() const;
+
   /**
    * @brief Wait or cleanup a process, usually a child process.
    *
@@ -119,7 +121,7 @@ class PlatformProcess : private boost::noncopyable {
    *
    * @return true if the process was cleaned, otherwise false.
    */
-  bool cleanup() const;
+  bool cleanup(std::chrono::milliseconds timeout) const;
 
   /// Returns whether the PlatformProcess object is valid
   bool isValid() const {

@@ -9,6 +9,8 @@
 
 #include "query_data.h"
 
+#include <algorithm>
+
 namespace rj = rapidjson;
 
 namespace osquery {
@@ -23,7 +25,7 @@ Status serializeQueryData(const QueryData& q,
     if (!status.ok()) {
       return status;
     }
-    doc.push(row_obj, arr);
+    doc.pushCopy(row_obj, arr);
   }
   return Status::success();
 }
@@ -38,7 +40,7 @@ Status serializeQueryData(const QueryDataTyped& q,
     if (!status.ok()) {
       return status;
     }
-    doc.push(row_obj, arr);
+    doc.pushCopy(row_obj, arr);
   }
   return Status::success();
 }

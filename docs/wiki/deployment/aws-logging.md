@@ -4,7 +4,7 @@ As of osquery version 1.7.4, osquery can log results directly to Amazon AWS [Kin
 
 ## Configuration
 
-The Kinesis Streams and Kinesis Firehose logger plugins are named `aws_kinesis` and `aws_firehose` respectively. They can be enabled as with other logger plugins using the config flag `logger_plugin`.
+The Kinesis Streams and Kinesis Firehose logger plugins are named `aws_kinesis` and `aws_firehose` respectively. They can be enabled as with other logger plugins using the [CLI flag](https://github.com/osquery/osquery/blob/master/docs/wiki/installation/cli-flags.md) `logger_plugin`. For this example, both logger plugins must be enabled via `--logger-plugin=aws_kinesis,aws_firehose`.
 
 Some configuration is shared between the two plugins:
 
@@ -27,7 +27,7 @@ Some configuration is shared between the two plugins:
 
 When working with AWS, osquery will look for credentials and region configuration in the following order:
 
-1. Configuration flags
+1. Configuration flags; for the region, the service specific flags first (sts, kinesis, firehose) and then `aws_region` as a fallback
 2. Profile from the [AWS config files](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html) (only if `--aws_profile_name` is specified)
 3. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
 4. `default` profile in the AWS config files
@@ -41,9 +41,17 @@ When logging to Kinesis Streams, the stream name must be specified with `aws_kin
 
 Setting `aws_kinesis_random_partition_key` to `true` will use random partition keys when sending data to Kinesis. Using random values will load balance over stream shards if you are using multiple shards in a stream. Note that using this setting will result in the logs of each host distributed across shards, so do not use it if you need logs from each host to be processed by a consistent shard. The default for this setting is `false`.
 
+Custom endpoint for non-AWS Kinesis implementations can be specified with `aws_kinesis_endpoint`.
+
+If the region to be used is different from the default one present in `aws_region`, or the one in the profile file, then `aws_kinesis_region` can be used.
+
 ### Kinesis Firehose
 
 Similarly for Kinesis Firehose delivery streams, the stream name must be specified with `aws_firehose_stream`, and the period can be configured with `aws_firehose_period`.
+
+Custom endpoint for non-AWS Firehose implementations can be specified with `aws_firehose_endpoint`.
+
+If the region to be used is different from the default one present in `aws_region`, or the one in the profile file, then `aws_firehose_region` can be used.
 
 ### Sample Config File
 
@@ -52,7 +60,6 @@ Similarly for Kinesis Firehose delivery streams, the stream name must be specifi
   "options": {
     "host_identifier": "hostname",
     "schedule_splay_percent": 10,
-    "logger_plugin": "aws_kinesis,aws_firehose",
     "aws_kinesis_stream": "foo_stream",
     "aws_firehose_stream": "bar_delivery_stream",
     "aws_access_key_id": "ACCESS_KEY",

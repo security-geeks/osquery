@@ -52,6 +52,7 @@ constexpr auto kTestProfilePreferences = R"PREFERENCES(
 
 constexpr auto kOutOfProfileTestExtensionPath =
     "C:\\absolute\\path\\to\\extension\\1.00.0_0";
+constexpr auto kTestExtensionPreferencesPath = "extension\\\\1.00.0_0";
 
 #else
 constexpr auto kTestProfilePath = "/home/user/.config/google-chrome/Default";
@@ -83,7 +84,35 @@ constexpr auto kTestProfilePreferences = R"PREFERENCES(
 
 constexpr auto kOutOfProfileTestExtensionPath =
     "/absolute/path/to/extension/1.00.0_0";
+constexpr auto kTestExtensionPreferencesPath = "extension/1.00.0_0";
 #endif
+
+std::string makeTestPreferences(const std::string& extension_properties) {
+  auto properties = extension_properties;
+  if (!properties.empty()) {
+    properties += ",";
+  }
+
+  return R"PREFERENCES({
+  "extensions": {
+    "settings": {
+      "extension_identifier1": {
+        )PREFERENCES" +
+         properties + "\"path\": \"" + kTestExtensionPreferencesPath +
+         R"PREFERENCES("
+      }
+    }
+  },
+  "profile": { "name": "test" }
+})PREFERENCES";
+}
+
+constexpr auto kTestPreferencesWithoutExtension = R"PREFERENCES(
+{
+  "extensions": { "settings": {} },
+  "profile": { "name": "test" }
+}
+)PREFERENCES";
 
 constexpr auto kTestExtensionManifest = R"MANIFEST(
 {
@@ -102,6 +131,7 @@ constexpr auto kTestExtensionManifest = R"MANIFEST(
   "default_locale": "en",
   "current_locale": "en",
   "description": "Description",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmJNzUNVjS6Q1qe0NRqpmfX/oSJdgauSZNdfeb5RV1Hji21vX0TivpP5gq0fadwmvmVCtUpOaNUopgejiUFm/iKHPs0o3x7hyKk/eX0t2QT3OZGdXkPiYpTEC0f0p86SQaLoA2eHaOG4uCGi7sxLJmAXc6IsxGKVklh7cCoLUgWEMnj8ZNG2Y8UKG3gBdrpES5hk7QyFDMraO79NmSlWRNgoJHX6XRoY66oYThFQad8KL8q3pf3Oe8uBLKywohU0ZrDPViWHIszXoE9HEvPTFAbHZ1umINni4W/YVs+fhqHtzRJcaKJtsTaYy+cholu5mAYeTZqtHf6bcwJ8t9i2afwIDAQAB",
   "name": "Test extension",
   "permissions": [ "1", "2" ],
   "optional_permissions": [ "3", "4" ],
@@ -121,6 +151,19 @@ constexpr auto kTestLocalizationFile = R"LOCALIZATION(
 }
 )LOCALIZATION";
 
+constexpr auto kTestProfilePreferencesWithSearchEngine = R"PREFERENCES(
+{
+  "default_search_provider_data": {
+    "template_url_data": {
+      "short_name": "Test Search",
+      "keyword": "test",
+      "url": "https://search.example.com/?q={searchTerms}"
+    }
+  },
+  "profile": { "name": "test" }
+}
+)PREFERENCES";
+
 const std::vector<std::pair<std::string, std::string>>
     kExpectedContentScriptsMatches = {
         {"/js/1.js", "http://*/1*"},
@@ -136,6 +179,14 @@ const std::vector<std::pair<std::string, std::string>>
 const std::unordered_map<std::string, std::string>
     kExpectedExtensionProperties = {
         {"name", "Test extension"},
+        {"key",
+         "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmJNzUNVjS6Q1qe0NRqpmfX/"
+         "oSJdgauSZNdfeb5RV1Hji21vX0TivpP5gq0fadwmvmVCtUpOaNUopgejiUFm/"
+         "iKHPs0o3x7hyKk/"
+         "eX0t2QT3OZGdXkPiYpTEC0f0p86SQaLoA2eHaOG4uCGi7sxLJmAXc6IsxGKVklh7cCoLU"
+         "gWEMnj8ZNG2Y8UKG3gBdrpES5hk7QyFDMraO79NmSlWRNgoJHX6XRoY66oYThFQad8KL8"
+         "q3pf3Oe8uBLKywohU0ZrDPViWHIszXoE9HEvPTFAbHZ1umINni4W/"
+         "YVs+fhqHtzRJcaKJtsTaYy+cholu5mAYeTZqtHf6bcwJ8t9i2afwIDAQAB"},
         {"update_url", "https://clients2.google.com/service/update2/crx"},
         {"version", "1.00.0"},
         {"author", "Author"},
@@ -145,9 +196,31 @@ const std::unordered_map<std::string, std::string>
         {"description", "Description"},
         {"permissions", "1, 2"},
         {"optional_permissions", "3, 4"},
-        {"permissions_json", "{\"\":\"1\",\"\":\"2\"}\n"},
-        {"optional_permissions_json", "{\"\":\"3\",\"\":\"4\"}\n"},
+        {"permissions_json", "{\"\":\"1\",\"\":\"2\"}"},
+        {"optional_permissions_json", "{\"\":\"3\",\"\":\"4\"}"},
 };
+
+const std::string kExpectedComputedExtensionIdentifier{
+    "cjpalhdlnbpafiamejdnhcphjbkeiagm"};
+
+ChromeProfileList getProfilesForTestPreferences(
+    const std::string& preferences,
+    const std::string& secure_preferences = {}) {
+  ChromeProfileSnapshot::Extension extension_snapshot;
+  extension_snapshot.path = kTestExtensionPath;
+  extension_snapshot.manifest = kTestExtensionManifest;
+
+  ChromeProfileSnapshot snapshot;
+  snapshot.type = ChromeBrowserType::GoogleChrome;
+  snapshot.path = kTestProfilePath;
+  snapshot.preferences = preferences;
+  snapshot.secure_preferences = secure_preferences;
+  snapshot.uid = 1000;
+  snapshot.referenced_extensions.insert(
+      {extension_snapshot.path, extension_snapshot});
+
+  return getChromeProfilesFromSnapshotList({snapshot});
+}
 
 } // namespace
 
@@ -168,6 +241,45 @@ TEST_F(ChromeUtilsTests, getChromeBrowserName) {
 
   browser_name = getChromeBrowserName(ChromeBrowserType::Opera);
   EXPECT_EQ(browser_name, "opera");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::Edge);
+  EXPECT_EQ(browser_name, "edge");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::EdgeBeta);
+  EXPECT_EQ(browser_name, "edge_beta");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::GoogleChromeBeta);
+  EXPECT_EQ(browser_name, "chrome_beta");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::GoogleChromeDev);
+  EXPECT_EQ(browser_name, "chrome_dev");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::GoogleChromeCanary);
+  EXPECT_EQ(browser_name, "chrome_canary");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::BraveBeta);
+  EXPECT_EQ(browser_name, "brave_beta");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::BraveNightly);
+  EXPECT_EQ(browser_name, "brave_nightly");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::EdgeDev);
+  EXPECT_EQ(browser_name, "edge_dev");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::EdgeCanary);
+  EXPECT_EQ(browser_name, "edge_canary");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::Vivaldi);
+  EXPECT_EQ(browser_name, "vivaldi");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::Arc);
+  EXPECT_EQ(browser_name, "arc");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::Dia);
+  EXPECT_EQ(browser_name, "dia");
+
+  browser_name = getChromeBrowserName(ChromeBrowserType::PerplexityComet);
+  EXPECT_EQ(browser_name, "comet");
 }
 
 TEST_F(ChromeUtilsTests, getExtensionContentScriptsMatches) {
@@ -196,6 +308,11 @@ TEST_F(ChromeUtilsTests, getExtensionContentScriptsMatches) {
   }
 }
 
+std::string trim_trailing_newline(const std::string& str) {
+  auto end = str.find_last_not_of('\n');
+  return (end == std::string::npos) ? "" : str.substr(0, end + 1);
+}
+
 TEST_F(ChromeUtilsTests, getExtensionProperties) {
   pt::iptree parsed_manifest;
 
@@ -218,7 +335,8 @@ TEST_F(ChromeUtilsTests, getExtensionProperties) {
     ASSERT_TRUE(property_it != properties.end());
 
     const auto& value = property_it->second;
-    EXPECT_EQ(value, expected_value);
+    std::string trimmed_value = trim_trailing_newline(value);
+    EXPECT_EQ(trimmed_value, expected_value);
   }
 }
 
@@ -290,14 +408,17 @@ TEST_F(ChromeUtilsTests, getExtensionProfileSettings) {
   auto state = getExtensionProfileSettingsValue(extension, "state");
   auto from_webstore =
       getExtensionProfileSettingsValue(extension, "from_webstore");
+
   auto install_time =
       getExtensionProfileSettingsValue(extension, "install_time");
-  auto identifier = getExtensionProfileSettingsValue(extension, "identifier");
+
+  auto ref_identifier =
+      getExtensionProfileSettingsValue(extension, "referenced_identifier");
 
   EXPECT_EQ(state, "1");
   EXPECT_EQ(from_webstore, "true");
   EXPECT_EQ(install_time, "13251308956895241");
-  EXPECT_EQ(identifier, "extension_identifier1");
+  EXPECT_EQ(ref_identifier, "extension_identifier1");
 
   status = getExtensionProfileSettings(extension.profile_settings,
                                        parsed_preferences,
@@ -307,12 +428,13 @@ TEST_F(ChromeUtilsTests, getExtensionProfileSettings) {
   state = getExtensionProfileSettingsValue(extension, "state");
   from_webstore = getExtensionProfileSettingsValue(extension, "from_webstore");
   install_time = getExtensionProfileSettingsValue(extension, "install_time");
-  identifier = getExtensionProfileSettingsValue(extension, "identifier");
+  ref_identifier =
+      getExtensionProfileSettingsValue(extension, "referenced_identifier");
 
   EXPECT_EQ(state, "0");
   EXPECT_EQ(from_webstore, "false");
   EXPECT_EQ(install_time, "13251308956895242");
-  EXPECT_EQ(identifier, "extension_identifier2");
+  EXPECT_EQ(ref_identifier, "extension_identifier2");
 }
 
 TEST_F(ChromeUtilsTests, getExtensionFromSnapshot) {
@@ -343,6 +465,12 @@ TEST_F(ChromeUtilsTests, getExtensionFromSnapshot) {
 
   EXPECT_EQ(extension.content_scripts_matches.size(),
             kExpectedContentScriptsMatches.size());
+
+  // Also make sure that the computed identifier is correct
+  ASSERT_TRUE(extension.opt_computed_identifier.has_value());
+
+  const auto& computed_identifier = *extension.opt_computed_identifier;
+  EXPECT_EQ(computed_identifier, kExpectedComputedExtensionIdentifier);
 }
 
 TEST_F(ChromeUtilsTests, getChromeProfilesFromSnapshotList) {
@@ -381,10 +509,151 @@ TEST_F(ChromeUtilsTests, getChromeProfilesFromSnapshotList) {
   const auto& unreferenced_extension = profile.extension_list.at(0U);
   ASSERT_FALSE(unreferenced_extension.referenced);
   ASSERT_TRUE(unreferenced_extension.profile_settings.empty());
+  EXPECT_EQ(getExtensionProfileSettingsValue(unreferenced_extension, "state"),
+            "");
 
   const auto& referenced_extension = profile.extension_list.at(1U);
   ASSERT_TRUE(referenced_extension.referenced);
   ASSERT_FALSE(referenced_extension.profile_settings.empty());
+}
+
+TEST_F(ChromeUtilsTests,
+       getChromeProfilesFromSnapshotList_modernExtensionState) {
+  const std::vector<std::pair<std::string, std::string>> test_cases = {
+      {R"("from_webstore": true)", "1"},
+      {R"("disable_reasons": [1])", "0"},
+      {R"("disable_reasons": [])", "1"},
+      {R"("disable_reasons": ["1"])", "1"},
+      {R"("disable_reasons": ["ignored", 1])", "0"},
+      {R"("disable_reasons": 1)", ""},
+      {R"("disable_reasons": {"reason": 1})", ""},
+      {R"("disable_reasons": [0])", "0"},
+      {R"("disable_reasons": [-1])", "0"},
+      {R"("state": 2)", "2"},
+      {R"("state": 1, "disable_reasons": [1])", "1"},
+      {R"("state": {"value": 1})", ""},
+  };
+
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(test_case.first);
+    const auto profile_list =
+        getProfilesForTestPreferences(makeTestPreferences(test_case.first));
+    ASSERT_EQ(profile_list.size(), 1U);
+    ASSERT_EQ(profile_list.at(0).extension_list.size(), 1U);
+
+    const auto& extension = profile_list.at(0).extension_list.at(0);
+    EXPECT_EQ(getExtensionProfileSettingsValue(extension, "state"),
+              test_case.second);
+  }
+}
+
+TEST_F(ChromeUtilsTests,
+       getChromeProfilesFromSnapshotList_modernStateSecurePreferencesFallback) {
+  struct TestCase final {
+    std::string preferences;
+    std::string secure_preferences;
+    std::string expected_state;
+  };
+
+  const std::vector<TestCase> test_cases = {
+      {makeTestPreferences(R"("from_webstore": true)"),
+       makeTestPreferences(R"("disable_reasons": [1])"),
+       "0"},
+      {makeTestPreferences(R"("disable_reasons": [1])"),
+       makeTestPreferences(R"("state": 1)"),
+       "1"},
+      {makeTestPreferences(R"("from_webstore": true)"),
+       makeTestPreferences(R"("disable_reasons": 1)"),
+       ""},
+      {makeTestPreferences(R"("disable_reasons": 1)"),
+       makeTestPreferences(R"("disable_reasons": [1])"),
+       "0"},
+      {makeTestPreferences(R"("state": 1)"),
+       makeTestPreferences(R"("disable_reasons": [1])"),
+       "0"},
+      {makeTestPreferences(R"("disable_reasons": [1])"),
+       makeTestPreferences(R"("disable_reasons": [])"),
+       "1"},
+      {makeTestPreferences(R"("disable_reasons": [1])"),
+       makeTestPreferences(R"("disable_reasons": ["1"])"),
+       "1"},
+      {makeTestPreferences(R"("disable_reasons": [1])"),
+       makeTestPreferences(R"("from_webstore": true)"),
+       "0"},
+  };
+
+  for (const auto& test_case : test_cases) {
+    const auto profile_list = getProfilesForTestPreferences(
+        test_case.preferences, test_case.secure_preferences);
+    ASSERT_EQ(profile_list.size(), 1U);
+    ASSERT_EQ(profile_list.at(0).extension_list.size(), 1U);
+
+    const auto& extension = profile_list.at(0).extension_list.at(0);
+    EXPECT_EQ(getExtensionProfileSettingsValue(extension, "state"),
+              test_case.expected_state);
+  }
+
+  const auto secure_only_profile_list = getProfilesForTestPreferences(
+      kTestPreferencesWithoutExtension,
+      makeTestPreferences(R"("from_webstore": false,
+                              "install_time": "42",
+                              "disable_reasons": [1])"));
+  ASSERT_EQ(secure_only_profile_list.size(), 1U);
+  ASSERT_EQ(secure_only_profile_list.at(0).extension_list.size(), 1U);
+
+  const auto& secure_only_extension =
+      secure_only_profile_list.at(0).extension_list.at(0);
+  EXPECT_EQ(getExtensionProfileSettingsValue(secure_only_extension, "state"),
+            "0");
+  EXPECT_EQ(
+      getExtensionProfileSettingsValue(secure_only_extension, "from_webstore"),
+      "false");
+  EXPECT_EQ(
+      getExtensionProfileSettingsValue(secure_only_extension, "install_time"),
+      "42");
+}
+
+TEST_F(ChromeUtilsTests,
+       getChromeProfilesFromSnapshotList_defaultSearchEngine) {
+  ChromeProfileSnapshot snapshot;
+  snapshot.type = ChromeBrowserType::GoogleChrome;
+  snapshot.path = kTestProfilePath;
+  snapshot.preferences = kTestProfilePreferencesWithSearchEngine;
+  snapshot.uid = 1000;
+
+  auto chrome_profile_list = getChromeProfilesFromSnapshotList({snapshot});
+  ASSERT_EQ(chrome_profile_list.size(), 1U);
+
+  const auto& profile = chrome_profile_list.at(0);
+
+  ASSERT_TRUE(profile.search_engine_name.has_value());
+  EXPECT_EQ(*profile.search_engine_name, "Test Search");
+
+  ASSERT_TRUE(profile.search_engine_keyword.has_value());
+  EXPECT_EQ(*profile.search_engine_keyword, "test");
+
+  ASSERT_TRUE(profile.search_engine_url.has_value());
+  EXPECT_EQ(*profile.search_engine_url,
+            "https://search.example.com/?q={searchTerms}");
+}
+
+TEST_F(ChromeUtilsTests, getChromeProfilesFromSnapshotList_noSearchEngine) {
+  // kTestProfilePreferences (used throughout the rest of this file) has no
+  // default_search_provider_data node; make sure the new fields are left
+  // unset in that case rather than defaulting to empty strings.
+  ChromeProfileSnapshot snapshot;
+  snapshot.type = ChromeBrowserType::GoogleChrome;
+  snapshot.path = kTestProfilePath;
+  snapshot.preferences = kTestProfilePreferences;
+  snapshot.uid = 1000;
+
+  auto chrome_profile_list = getChromeProfilesFromSnapshotList({snapshot});
+  ASSERT_EQ(chrome_profile_list.size(), 1U);
+
+  const auto& profile = chrome_profile_list.at(0);
+  EXPECT_FALSE(profile.search_engine_name.has_value());
+  EXPECT_FALSE(profile.search_engine_keyword.has_value());
+  EXPECT_FALSE(profile.search_engine_url.has_value());
 }
 
 TEST_F(ChromeUtilsTests, webkitTimeToUnixTimestamp) {
@@ -397,6 +666,35 @@ TEST_F(ChromeUtilsTests, webkitTimeToUnixTimestamp) {
   timestamp_exp = webkitTimeToUnixTimestamp("100");
   ASSERT_TRUE(timestamp_exp.isError());
   ASSERT_EQ(timestamp_exp.getErrorCode(), ConversionError::InvalidArgument);
+}
+
+TEST_F(ChromeUtilsTests, computeExtensionIdentifier) {
+  ChromeProfile::Extension extension;
+  auto identifier_exp = computeExtensionIdentifier(extension);
+  ASSERT_TRUE(identifier_exp.isError());
+  EXPECT_EQ(identifier_exp.getErrorCode(), ExtensionKeyError::MissingProperty);
+
+  extension.properties.insert({"key", "hello, world!"});
+
+  identifier_exp = computeExtensionIdentifier(extension);
+  ASSERT_TRUE(identifier_exp.isError());
+  EXPECT_EQ(identifier_exp.getErrorCode(), ExtensionKeyError::InvalidValue);
+
+  extension.properties.clear();
+  extension.properties.insert(
+      {"key",
+       "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmJNzUNVjS6Q1qe0NRqpmfX/"
+       "oSJdgauSZNdfeb5RV1Hji21vX0TivpP5gq0fadwmvmVCtUpOaNUopgejiUFm/"
+       "iKHPs0o3x7hyKk/"
+       "eX0t2QT3OZGdXkPiYpTEC0f0p86SQaLoA2eHaOG4uCGi7sxLJmAXc6IsxGKVklh7cCoLUgW"
+       "EMnj8ZNG2Y8UKG3gBdrpES5hk7QyFDMraO79NmSlWRNgoJHX6XRoY66oYThFQad8KL8q3pf"
+       "3Oe8uBLKywohU0ZrDPViWHIszXoE9HEvPTFAbHZ1umINni4W/"
+       "YVs+fhqHtzRJcaKJtsTaYy+cholu5mAYeTZqtHf6bcwJ8t9i2afwIDAQAB"});
+  identifier_exp = computeExtensionIdentifier(extension);
+  ASSERT_FALSE(identifier_exp.isError());
+
+  auto identifier = identifier_exp.get();
+  EXPECT_EQ(identifier, kExpectedComputedExtensionIdentifier);
 }
 
 } // namespace tables

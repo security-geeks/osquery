@@ -19,7 +19,7 @@ page](https://github.com/orgs/osquery/teams) on the osquery GitHub
 organization.
 
 If you need help, both the core team and community members are on the osquery [Slack](https://osquery.slack.com).
-Feel free to register using the following [shared invite](https://join.slack.com/t/osquery/shared_invite/zt-h29zm0gk-s2DBtGUTW4CFel0f0IjTEw).
+Feel free to register using the following [shared invite](https://join.slack.com/t/osquery/shared_invite/zt-1wipcuc04-DBXmo51zYJKBu3_EP3xZPA).
 The `#code-review` Slack channel has been set up to handle urgent review needs as well as questions about your PR.
 Note: prefer to keep discussion about code changes in the GitHub pull request thread.
 
@@ -205,6 +205,31 @@ Belongs in an extension:
 * Expands the scope of use for osquery beyond endpoint monitoring
 * Integrates with a proprietary or esoteric tool that is not widely applicable
 
+## How to Make an Osquery Release
+
+The osquery release process is split across a couple of places, and it's not 100% automated. Note that several of these steps require a high degree of permissions.
+
+Phase 1, build a beta binary:
+
+1. Use the GitHub Release page to make a new tag and and osquery release. Leave it in `pre-release` state
+2. This will trigger a CI build, it will take 40ish minutes. 
+3. Sign the release and push it to GitHub. This is done via a [codesigning action](https://github.com/osquery/osquery-codesign/actions/workflows/build-and-sign.yml)
+5. Release it to the _testing_ bucket. Using another [action workflow](https://github.com/osquery/osquery-codesign/actions/workflows/release-to-buckets.yml) (make sure test is selected)
+4. Announce it to slack
+5. Give people time to test 1-2 weeks usually
+
+Phase 2, release it to stable
+
+Once the beta has been out a couple weeks, we usually discuss on office hours or slack when it's ready to launch.
+
+1. Edit the GitHub release to make it as stable
+2. Release it to the _prod_ bucket. Using the [action workflow](https://github.com/osquery/osquery-codesign/actions/workflows/release-to-buckets.yml) (make sure prod is selected)
+3. Wait, it will take about 15 minutes
+4. Update the website to reflect the new release. There's a [GitHub Action](https://github.com/osquery/osquery-site/actions/workflows/release-pr.yml) to make a PR
+5. Approve and Merge it! (You'll need to override the CLA signoff check)
+
+
+
 ## Contributor License Agreement
 
 You must submit a Contributor License Agreement (CLA) before we can
@@ -230,9 +255,12 @@ Current Members (in alphabetical order):
 * Alessandro -- [@alessandrogario](https://github.com/alessandrogario)
 * Nick -- [@muffins](https://github.com/muffins)
 * seph -- [@directionless](https://github.com/directionless)
+* Sharvil -- [@sharvilshah](https://github.com/sharvilshah)
 * Teddy -- [@theopolis](https://github.com/theopolis)
 * Victor -- [@groob](https://github.com/groob)
 * Zach -- [@zwass](https://github.com/zwass)
+
+The Technical Steering Commit is chaired by seph. 
 
 ## License
 

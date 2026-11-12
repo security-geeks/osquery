@@ -7,9 +7,11 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
-extern "C" {
-#include <xar/xar.h>
-}
+#include <boost/algorithm/string/predicate.hpp>
+
+#include <map>
+#include <string>
+#include <vector>
 
 #include <osquery/core/system.h>
 #include <osquery/core/tables.h>
@@ -37,11 +39,28 @@ inline void jsonBoolAsInt(std::string& s) {
 
 } // namespace
 
-/// Each home directory will include custom extensions.
-#define kSafariExtensionsPath "/Library/Safari/Extensions/"
+/// Safari Extension Point Identifier
+#define kSafariExtensionPointIdentifier "com.apple.Safari"
 
-/// Safari extensions will not load unless they have the expected pattern.
-#define kSafariExtensionsPattern "%.safariextz"
+/// Safari App Extensions root directory (top-level apps)
+#define kSafariAppExtensionsPath "/Applications/"
+
+/// Safari App Extensions Info.plist glob under a single .app bundle.
+/// Relative (no leading slash) so it can be joined onto an .app path.
+#define kSafariAppExtensionsPlistRelativePath                                  \
+  "Contents/PlugIns/%.appex/Contents/Info.plist"
+
+/// User Safari extension path
+#define kUserSafariExtensionsPath                                              \
+  "/Library/Containers/com.apple.Safari/Data/Library/Safari"
+
+/// User Safari extension path for App Extensions
+#define kAppExtensionsPlistPath                                                \
+  kUserSafariExtensionsPath "/AppExtensions/Extensions.plist"
+
+/// User Safari extension path for Web Extensions
+#define kWebExtensionsPlistPath                                                \
+  kUserSafariExtensionsPath "/WebExtensions/Extensions.plist"
 
 #define kBrowserPluginsPath "/Library/Internet Plug-Ins/"
 
@@ -55,15 +74,37 @@ const std::map<std::string, std::string> kBrowserPluginKeys = {
     {"LSRequiresNativeExecution", "native"},
 };
 
-const std::map<std::string, std::string> kSafariExtensionKeys = {
-    {"CFBundleDisplayName", "name"},
-    {"CFBundleIdentifier", "identifier"},
-    {"CFBundleShortVersionString", "version"},
-    {"Author", "author"},
-    {"CFBundleInfoDictionaryVersion", "sdk"},
-    {"Description", "description"},
-    {"Update Manifest URL", "update_url"},
-    {"DeveloperIdentifier", "developer_id"},
+struct SandboxedExtensionData {
+  /// Extension Name
+  std::string name;
+
+  /// Extension Identifier
+  std::string identifier;
+
+  /// Extension Version
+  std::string version;
+
+  /// Extension SDK Version
+  std::string sdk;
+
+  /// Parent App
+  std::string app_path;
+
+  /// Human Readable Description
+  std::string hr_description;
+
+  /// CF Bundle Version
+  std::string cf_bundle_version;
+
+  /// NS Human Readable Copyright
+  std::string ns_hr_copyright;
+};
+
+using SandboxedExtensionsData = std::vector<SandboxedExtensionData>;
+
+const std::vector<std::string> kExtensionsAppDirsToExclude = {
+    "/Xcode.app",
+    "/Safari.app",
 };
 
 void genBrowserPlugin(const std::string& uid,
@@ -139,114 +180,335 @@ QueryData genBrowserPlugins(QueryContext& context) {
   return results;
 }
 
-inline void genSafariExtension(const std::string& uid,
-                               const std::string& gid,
-                               const std::string& path,
-                               QueryData& results) {
-  Row r;
-  r["uid"] = uid;
-  r["path"] = path;
-
+inline bool getPtreeFromPlist(const fs::path& plist_path, pt::ptree& tree) {
   // Perform a dry run of the file read.
-  if (!isReadable(path).ok()) {
+  if (!isReadable(plist_path).ok()) {
+    return false;
+  }
+
+  // Read the plist file
+  std::string content;
+  if (!readFile(plist_path, content).ok()) {
+    return false;
+  }
+
+  // Parse the plist content
+  if (!parsePlistContent(content, tree).ok()) {
+    return false;
+  }
+
+  return true;
+}
+
+inline void getSandboxedExtensionData(const std::string& extension_path,
+                                      const std::string& plist_path,
+                                      SandboxedExtensionsData& data) {
+  // Parse the plist content
+  pt::ptree tree;
+  if (!getPtreeFromPlist(plist_path, tree)) {
+    TLOG << "Ptree parsing failed: " << plist_path;
     return;
   }
 
-  // Finally drop privileges to the user controlling the extension.
-  auto dropper = DropPrivileges::get();
-  if (!dropper->dropTo(uid, gid)) {
-    VLOG(1) << "Cannot drop privileges to UID " << uid;
+  // Populating SandboxedExtensionData entry
+  SandboxedExtensionData entry;
+
+  // Checking first if this is a Safari extension by looking into NSExtension
+  if (tree.count("NSExtension") == 0) {
     return;
   }
 
-  xar_t xar = xar_open(path.c_str(), READ);
-  if (xar == nullptr) {
-    TLOG << "Cannot open extension archive: " << path;
+  const auto& extensionIdentifier =
+      tree.get_child("NSExtension")
+          .get<std::string>("NSExtensionPointIdentifier", "");
+
+  if (!boost::algorithm::contains(extensionIdentifier,
+                                  kSafariExtensionPointIdentifier)) {
     return;
   }
 
-  xar_iter_t iter = xar_iter_new();
-  xar_file_t xfile = xar_file_first(xar, iter);
+  // We found a Safari extension! Let's extract its metadata
+  entry.app_path = extension_path;
+  entry.identifier = tree.get<std::string>("CFBundleIdentifier", "");
+  entry.name = tree.get<std::string>("CFBundleDisplayName", "");
+  entry.sdk = tree.get<std::string>("CFBundleInfoDictionaryVersion", "");
+  entry.version = tree.get<std::string>("CFBundleShortVersionString", "");
+  entry.cf_bundle_version = tree.get<std::string>("CFBundleVersion", "");
+  entry.ns_hr_copyright = tree.get<std::string>("NSHumanReadableCopyright", "");
+  entry.hr_description =
+      tree.get<std::string>("NSHumanReadableDescription", "");
 
-  size_t max_files = 500;
-  for (size_t index = 0; index < max_files; ++index) {
-    if (xfile == nullptr) {
-      break;
-    }
+  data.push_back(entry);
+}
 
-    char* xfile_path = xar_get_path(xfile);
-    if (xfile_path == nullptr) {
-      break;
-    }
-
-    // Clean up the allocated content ASAP.
-    std::string entry_path(xfile_path);
-    free(xfile_path);
-    if (entry_path.find("Info.plist") != std::string::npos) {
-      if (xar_verify(xar, xfile) != XAR_STREAM_OK) {
-        TLOG << "Extension info extraction failed verification: " << path;
-      }
-
-      size_t size = 0;
-      char* buffer = nullptr;
-      if (xar_extract_tobuffersz(xar, xfile, &buffer, &size) != 0 ||
-          size == 0) {
-        break;
-      }
-
-      std::string content(buffer, size);
-      free(buffer);
-
-      pt::ptree tree;
-      if (parsePlistContent(content, tree).ok()) {
-        for (const auto& it : kSafariExtensionKeys) {
-          r[it.second] = tree.get(it.first, "");
-        }
-      }
-      break;
-    }
-
-    xfile = xar_file_next(iter);
+inline bool isExtensionAppExcluded(const std::string& app_dir) {
+  if (app_dir.empty()) {
+    return false;
   }
 
-  xar_iter_free(iter);
-  xar_close(xar);
-  results.push_back(r);
+  for (const auto& app_to_exclude : kExtensionsAppDirsToExclude) {
+    if (boost::algorithm::contains(app_dir, app_to_exclude)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/// Collect Safari .appex metadata from Info.plist paths discovered under
+/// @p pattern. @p appex_path is derived as the .appex bundle directory.
+inline void collectSafariExtensionsFromPattern(const fs::path& pattern,
+                                               SandboxedExtensionsData& data) {
+  std::vector<std::string> plist_paths;
+  auto status = resolveFilePattern(pattern, plist_paths);
+  if (!status.ok()) {
+    return;
+  }
+
+  for (const auto& plist_path : plist_paths) {
+    // .../Something.appex/Contents/Info.plist → .../Something.appex
+    const fs::path appex_path =
+        fs::path(plist_path).parent_path().parent_path();
+    if (isExtensionAppExcluded(appex_path.string())) {
+      continue;
+    }
+    getSandboxedExtensionData(appex_path.string(), plist_path, data);
+  }
+}
+
+/// Discover Safari App/Web extension bundles under top-level /Applications.
+inline void collectSafariExtensionsFromApplications(
+    SandboxedExtensionsData& data) {
+  if (!pathExists(kSafariAppExtensionsPath).ok()) {
+    return;
+  }
+
+  std::vector<std::string> app_directories;
+  if (!listDirectoriesInDirectory(
+          kSafariAppExtensionsPath, app_directories, false)) {
+    return;
+  }
+
+  for (const auto& app_directory : app_directories) {
+    if (isExtensionAppExcluded(app_directory)) {
+      continue;
+    }
+    collectSafariExtensionsFromPattern(
+        fs::path(app_directory) / kSafariAppExtensionsPlistRelativePath, data);
+  }
+}
+
+/// Discover Safari .app bundles under @p root (depth-limited) and collect
+/// their PlugIns/*.appex metadata. Prefer finding *.app over listing every
+/// file under Application Support (which is huge and can take minutes).
+inline void collectSafariExtensionsFromAppBundlesUnder(
+    const fs::path& root, SandboxedExtensionsData& data, size_t max_depth) {
+  if (max_depth == 0 || !pathExists(root).ok()) {
+    return;
+  }
+
+  boost::system::error_code ec;
+  fs::directory_iterator it(root, ec);
+  if (ec) {
+    return;
+  }
+  const fs::directory_iterator end;
+  for (; it != end; it.increment(ec)) {
+    if (ec) {
+      ec.clear();
+      continue;
+    }
+    const auto& entry = *it;
+    if (!fs::is_directory(entry.status(ec))) {
+      continue;
+    }
+    const auto name = entry.path().filename().string();
+    if (boost::algorithm::ends_with(name, ".app")) {
+      if (isExtensionAppExcluded(entry.path().string())) {
+        continue;
+      }
+      collectSafariExtensionsFromPattern(
+          entry.path() / kSafariAppExtensionsPlistRelativePath, data);
+      // Do not descend into .app bundles.
+      continue;
+    }
+    // Skip common high-churn cache/data trees that never host Safari .appex.
+    if (name == "Caches" || name == "logs" || name == "Logs" ||
+        name == "CrashReporter" || name == "Code Cache" || name == "GPUCache" ||
+        name == "CacheStorage") {
+      continue;
+    }
+    collectSafariExtensionsFromAppBundlesUnder(
+        entry.path(), data, max_depth - 1);
+  }
+}
+
+/// Discover Safari extension bundles under a user's Application Support tree
+/// (covers installs such as Webex that are not under /Applications).
+///
+/// Mid-path `%%`/`**` is not recursive in osquery's globber. Recursively list
+/// every file under Application Support is also too expensive (hundreds of
+/// thousands of files). Instead, depth-limited directory walk looking only for
+/// `*.app` bundles, then reuse the same PlugIns/*.appex pattern as
+/// /Applications.
+inline void collectSafariExtensionsFromAppSupport(
+    const std::string& user_dir, SandboxedExtensionsData& data) {
+  auto app_support = fs::path(user_dir) / "Library/Application Support";
+  // Depth 8 covers vendor/Add-ons/*.app layouts (e.g. WebEx
+  // Folder/Add-ons/...).
+  collectSafariExtensionsFromAppBundlesUnder(app_support, data, 8);
+}
+
+/// Load Extensions.plist keys once per user (App + Web). Keys are typically
+/// "BundleIdentifier (TeamIdentifier)".
+inline std::vector<std::string> loadSafariExtensionPlistKeys(
+    const fs::path& app_extension_plist, const fs::path& web_extension_plist) {
+  std::vector<std::string> keys;
+  auto append_keys = [&keys](const fs::path& plist_path) {
+    pt::ptree tree;
+    if (!getPtreeFromPlist(plist_path, tree)) {
+      return;
+    }
+    for (const auto& entry : tree) {
+      keys.push_back(entry.first);
+    }
+  };
+  append_keys(app_extension_plist);
+  append_keys(web_extension_plist);
+  return keys;
+}
+
+inline bool plistKeysContainExtensionIdentifier(
+    const std::vector<std::string>& keys, const std::string& identifier) {
+  if (identifier.empty()) {
+    return false;
+  }
+  for (const auto& key : keys) {
+    if (boost::algorithm::contains(key, identifier)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Dedupe extension metadata by CFBundleIdentifier, keeping the first-seen
+/// path for each identifier.
+inline SandboxedExtensionsData dedupeSafariExtensionsByIdentifier(
+    const SandboxedExtensionsData& input) {
+  SandboxedExtensionsData out;
+  std::map<std::string, size_t> index_by_id;
+  for (const auto& entry : input) {
+    if (entry.identifier.empty()) {
+      out.push_back(entry);
+      continue;
+    }
+    auto it = index_by_id.find(entry.identifier);
+    if (it == index_by_id.end()) {
+      index_by_id[entry.identifier] = out.size();
+      out.push_back(entry);
+    }
+  }
+  return out;
+}
+
+/// Merge per-user Application Support discoveries with /Applications,
+/// preferring /Applications for the same CFBundleIdentifier. App Support is
+/// merged per user so two users with the same identifier keep their own paths.
+inline SandboxedExtensionsData mergePreferringApplications(
+    const SandboxedExtensionsData& applications,
+    const SandboxedExtensionsData& app_support) {
+  auto out = dedupeSafariExtensionsByIdentifier(applications);
+  std::map<std::string, size_t> index_by_id;
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (!out[i].identifier.empty()) {
+      index_by_id[out[i].identifier] = i;
+    }
+  }
+  for (const auto& entry : app_support) {
+    if (entry.identifier.empty()) {
+      out.push_back(entry);
+      continue;
+    }
+    if (index_by_id.find(entry.identifier) == index_by_id.end()) {
+      index_by_id[entry.identifier] = out.size();
+      out.push_back(entry);
+    }
+  }
+  return out;
+}
+
+inline void genSafariSandboxedExtensions(const QueryContext& context,
+                                         QueryData& results) {
+  // Returning if there is no user context information
+  auto users = usersFromContext(context);
+  if (users.empty()) {
+    return;
+  }
+
+  // Discover sandboxed Safari extension bundles, then match them against each
+  // user's AppExtensions/WebExtensions registration plists. Discovery covers:
+  //   1) top-level /Applications/*.app (classic location; shared)
+  //   2) each queried user's ~/Library/Application Support tree (e.g. Webex)
+  // Matching still requires the extension to appear in the user's Safari
+  // Extensions.plist (plist registration is authoritative for "installed for
+  // this user"; disk scan supplies metadata/path).
+  SandboxedExtensionsData applications;
+  collectSafariExtensionsFromApplications(applications);
+  applications = dedupeSafariExtensionsByIdentifier(applications);
+
+  for (const auto& row : users) {
+    auto uid = row.at("uid");
+    auto user_dir = row.at("directory");
+
+    // Sanity check / skip non-user queries
+    if (uid.empty() || user_dir.empty() ||
+        !boost::algorithm::starts_with(user_dir, "/Users")) {
+      continue;
+    }
+
+    SandboxedExtensionsData app_support;
+    collectSafariExtensionsFromAppSupport(user_dir, app_support);
+    auto candidates = mergePreferringApplications(applications, app_support);
+    if (candidates.empty()) {
+      continue;
+    }
+
+    // Parse each user's Extensions.plist once (not once per candidate).
+    const auto plist_keys = loadSafariExtensionPlistKeys(
+        fs::path(user_dir) / kAppExtensionsPlistPath,
+        fs::path(user_dir) / kWebExtensionsPlistPath);
+
+    for (const auto& extension_data : candidates) {
+      if (!plistKeysContainExtensionIdentifier(plist_keys,
+                                               extension_data.identifier)) {
+        continue;
+      }
+      Row r;
+      r["uid"] = uid;
+      r["name"] = extension_data.name;
+      r["identifier"] = extension_data.identifier;
+      r["version"] = extension_data.version;
+      r["sdk"] = extension_data.sdk;
+      r["path"] = extension_data.app_path;
+      r["bundle_version"] = extension_data.cf_bundle_version;
+      r["copyright"] = extension_data.ns_hr_copyright;
+      r["description"] = extension_data.hr_description;
+      results.push_back(r);
+    }
+  }
 }
 
 QueryData genSafariExtensions(QueryContext& context) {
   QueryData results;
 
-  // Iterate over each user
-  auto users = usersFromContext(context);
-  for (const auto& row : users) {
-    auto uid = row.find("uid");
-    auto gid = row.find("gid");
-    auto directory = row.find("directory");
-    if (uid == row.end() || gid == row.end() || directory == row.end()) {
-      continue;
-    }
-
-    auto dir = fs::path(directory->second) / kSafariExtensionsPath;
-    // Check that an extensions directory exists.
-    if (!pathExists(dir).ok()) {
-      continue;
-    }
-
-    // Glob the extension files.
-    std::vector<std::string> paths;
-    if (!resolveFilePattern(
-             dir / kSafariExtensionsPattern, paths, GLOB_ALL | GLOB_NO_CANON)
-             .ok()) {
-      continue;
-    }
-
-    for (const auto& extension_path : paths) {
-      genSafariExtension(uid->second, gid->second, extension_path, results);
-    }
-  }
+  // Getting Sandboxed Safari Extensions metainformation
+  // Logic is capable of extracting metainformation from Safari Web extensions
+  // and Safari App Extensions models.
+  // This logic requires Full Disk Access (FDA) rights.
+  genSafariSandboxedExtensions(context, results);
 
   return results;
 }
-}
-}
+
+} // namespace tables
+} // namespace osquery

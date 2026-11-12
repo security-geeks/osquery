@@ -29,38 +29,6 @@ CLI_FLAG(bool,
 
 std::atomic<bool> kCarverPendingCarves{true};
 
-/// Helper function to update values related to a carve
-void updateCarveValue(const std::string& guid,
-                      const std::string& key,
-                      const std::string& value) {
-  std::string carve;
-  auto s = getDatabaseValue(kCarves, kCarverDBPrefix + guid, carve);
-  if (!s.ok()) {
-    VLOG(1) << "Failed to update status of carve in database " << guid;
-    return;
-  }
-
-  JSON tree;
-  s = tree.fromString(carve);
-  if (!s.ok()) {
-    VLOG(1) << "Failed to parse carve entries: " << s.what();
-    return;
-  }
-
-  tree.add(key, value);
-
-  std::string out;
-  s = tree.toString(out);
-  if (!s.ok()) {
-    VLOG(1) << "Failed to serialize carve entries: " << s.what();
-  }
-
-  s = setDatabaseValue(kCarves, kCarverDBPrefix + guid, out);
-  if (!s.ok()) {
-    VLOG(1) << "Failed to update status of carve in database " << guid;
-  }
-}
-
 std::string createCarveGuid() {
   return boost::uuids::to_string(boost::uuids::random_generator()());
 }
@@ -71,17 +39,17 @@ Status carvePaths(const std::set<std::string>& paths,
   carve_guid = createCarveGuid();
 
   JSON tree;
-  tree.add("carve_guid", carve_guid);
-  tree.add("time", getUnixTime());
-  tree.add("status", kCarverStatusScheduled);
-  tree.add("sha256", "");
-  tree.add("size", -1);
-  tree.add("request_id", request_id);
+  tree.addCopy("carve_guid", carve_guid);
+  tree.addCopy("time", getUnixTime());
+  tree.addCopy("status", kCarverStatusScheduled);
+  tree.addCopy("sha256", "");
+  tree.addCopy("size", -1);
+  tree.addCopy("request_id", request_id);
 
   if (paths.size() > 1) {
-    tree.add("path", osquery::join(paths, ","));
+    tree.addCopy("path", osquery::join(paths, ","));
   } else {
-    tree.add("path", *(paths.begin()));
+    tree.addCopy("path", *(paths.begin()));
   }
 
   std::string out;

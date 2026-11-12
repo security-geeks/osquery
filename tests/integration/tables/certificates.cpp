@@ -10,8 +10,9 @@
 // Sanity check integration test for certificates
 // Spec file: specs/macwin/certificates.table
 
+#include <osquery/dispatcher/dispatcher.h>
 #include <osquery/tests/integration/tables/helper.h>
-
+#include <osquery/tests/test_util.h>
 #include <osquery/utils/info/platform_type.h>
 
 namespace osquery {
@@ -22,6 +23,19 @@ class certificates : public testing::Test {
   void SetUp() override {
     setUpEnvironment();
   }
+
+#ifdef OSQUERY_WINDOWS
+  static void SetUpTestSuite() {
+    initUsersAndGroupsServices(true, false);
+  }
+
+  static void TearDownTestSuite() {
+    Dispatcher::stopServices();
+    Dispatcher::joinServices();
+    deinitUsersAndGroupsServices(true, false);
+    Dispatcher::instance().resetStopping();
+  }
+#endif
 };
 
 TEST_F(certificates, test_sanity) {
@@ -32,7 +46,9 @@ TEST_F(certificates, test_sanity) {
   ValidationMap row_map = {
       {"common_name", NormalType},
       {"subject", NormalType},
+      {"subject2", NormalType},
       {"issuer", NormalType},
+      {"issuer2", NormalType},
       {"ca", IntType},
       {"self_signed", IntType},
       {"not_valid_before", NormalType},

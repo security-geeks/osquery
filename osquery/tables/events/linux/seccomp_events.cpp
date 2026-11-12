@@ -16,10 +16,7 @@
 
 namespace osquery {
 
-FLAG(bool,
-     audit_allow_seccomp_events,
-     false,
-     "Allow the audit publisher to process seccomp events");
+DECLARE_bool(audit_allow_seccomp_events);
 
 REGISTER(SeccompEventSubscriber, "event_subscriber", "seccomp_events");
 
@@ -61,9 +58,7 @@ Status SeccompEventSubscriber::Callback(const ECRef& ec, const SCRef& sc) {
     return status;
   }
 
-  for (auto& row : data) {
-    add(row);
-  }
+  addBatch(data);
 
   return Status::success();
 }

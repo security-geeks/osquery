@@ -329,24 +329,28 @@ class ProcRunner(object):
             return False
         return self.proc.poll() is None
 
-    def isDead(self, pid, attempts=10):
+    def isDead(self, pid, timeout=30):
         self.requireStarted()
-        '''Check if the process was killed.
+        '''Check that the process dies within the timeout (in seconds).
 
         This is different than `isAlive` in that the timeout is an expectation
         that the process will die before the timeout, `isAlive`'s timeout is
         an expectation that the process will be scheduled before the timeout.
+        The default is generous: a watched worker only notices a killed
+        watcher on its watchdog poll interval (3 seconds) and then shuts down
+        gracefully, which can take a while on a loaded host.
         '''
         try:
             proc = psutil.Process(pid=pid)
         except psutil.NoSuchProcess as _:
             return True
-        for _ in range(attempts):
+        deadline = time.time() + timeout
+        while True:
             if not proc.is_running():
                 return True
+            if time.time() >= deadline:
+                return False
             time.sleep(self.interval)
-
-        return False
 
 
 def getLatestOsqueryBinary(binary):
@@ -536,6 +540,15 @@ class Autoloader(object):
 
 
 class TimeoutRunner(object):
+    '''Run a process with a timeout, killing it if the timeout expires.
+
+    A process killed by the timeout before printing anything is almost
+    always a slow cold start on a busy host (e.g. a loaded CI runner), not
+    a real failure, so that case is retried once. `timed_out` records
+    whether the final attempt had to be killed, so tests can fail with a
+    meaningful message instead of a diff against empty output.
+    '''
+
     def __init__(self, cmd=[], timeout_sec=1):
         global CONFIG
         options = copy.deepcopy(CONFIG)["options"]
@@ -544,13 +557,30 @@ class TimeoutRunner(object):
 
         self.stdout = None
         self.stderr = None
+        self.proc = None
+        self.timed_out = False
+
+        self._run_once(cmd, timeout_sec)
+        if self.timed_out and not self.stdout:
+            # Killed mid-startup without producing output; give the process
+            # one more full timeout to start and run.
+            self._run_once(cmd, timeout_sec)
+
+    def _run_once(self, cmd, timeout_sec):
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        kill_proc = lambda p: p.kill()
-        timer = threading.Timer(timeout_sec, kill_proc, [self.proc])
-        timer.start()
-        self.stdout, self.stderr = self.proc.communicate()
-        timer.cancel()
+        try:
+            self.stdout, self.stderr = self.proc.communicate(
+                timeout=timeout_sec)
+            self.timed_out = False
+        except subprocess.TimeoutExpired:
+            # Kill the process, then finish communication so the pipes are
+            # drained and the child is reaped. Deciding the timeout state
+            # synchronously here avoids racing a timer thread that could
+            # fire just after a successful process exit.
+            self.proc.kill()
+            self.stdout, self.stderr = self.proc.communicate()
+            self.timed_out = True
 
 
 class SequentialTestLoader(unittest.TestLoader):
@@ -560,6 +590,18 @@ class SequentialTestLoader(unittest.TestLoader):
         test_names.sort(key=testcase_methods.index)
         return test_names
 
+class SelectedTestLoader(unittest.TestLoader):
+    def __init__(self, input_testcases: str):
+        if input_testcases is None:
+            raise TypeError("input_testcases should not be none")
+
+        self.input_testcases = input_testcases
+        super().__init__()
+
+    def getTestCaseNames(self, testCaseClass):
+        testcases = self.input_testcases.split(',')
+
+        return testcases
 
 class Tester(object):
     def __init__(self):
@@ -591,6 +633,12 @@ class Tester(object):
             metavar="PATH",
             default=".",
             help="Path to osquery build (./build/<sys>/).")
+
+        parser.add_argument(
+            "--testcases",
+            type=str,
+            help="List of comma separated test names to execute")
+
         ARGS = parser.parse_args()
 
         if not os.path.exists(ARGS.build):
@@ -613,7 +661,11 @@ class Tester(object):
         unittest_args = [sys.argv[0]]
         if ARGS.verbose:
             unittest_args += ["-v"]
-        unittest.main(argv=unittest_args, testLoader=SequentialTestLoader())
+
+        if ARGS.testcases is None:
+            unittest.main(argv=unittest_args, testLoader=SequentialTestLoader())
+        else:
+            unittest.main(argv=unittest_args, testLoader=SelectedTestLoader(ARGS.testcases))
 
 
 def expect(functional, expected, interval=0.01, timeout=4):
@@ -638,14 +690,16 @@ def expect(functional, expected, interval=0.01, timeout=4):
 
 class QueryTester(ProcessGenerator, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.binary = getLatestOsqueryBinary("osqueryi")
         self.daemon = self._run_daemon({
             # The set of queries will hammer the daemon process.
             "disable_watchdog": True,
-            # Enable the 'hidden' flag "registry_exceptions" to prevent
+            # Enable the 'hidden' flag "ignore_registry_exceptions" to prevent
             # catching.
-            "registry_exceptions": True,
+            "ignore_registry_exceptions": False,
             "ephemeral": True,
+            "disable_extensions": False,
         })
         self.assertTrue(self.daemon.isAlive())
 

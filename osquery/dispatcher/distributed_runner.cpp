@@ -13,10 +13,11 @@
 #include <osquery/core/system.h>
 #include <osquery/database/database.h>
 #include <osquery/distributed/distributed.h>
+#include <osquery/logger/logger.h>
 
-#include <osquery/utils/system/time.h>
 #include <osquery/dispatcher/distributed_runner.h>
 #include <osquery/utils/conversions/tryto.h>
+#include <osquery/utils/system/time.h>
 
 namespace osquery {
 
@@ -30,13 +31,34 @@ DECLARE_string(distributed_plugin);
 
 const size_t kDistributedAccelerationInterval = 5;
 
+namespace {
+
+void logFailure(const std::string& action,
+                const Status& status,
+                bool& failing) {
+  if (status.ok()) {
+    failing = false;
+  } else if (!failing) {
+    LOG(WARNING) << "Failed to " << action << ": " << status.getMessage();
+    failing = true;
+  } else {
+    VLOG(1) << "Failed to " << action << ": " << status.getMessage();
+  }
+}
+
+} // namespace
+
 void DistributedRunner::start() {
   auto dist = Distributed();
+  // Whether the last attempt to pull queries or write results failed. Each
+  // is retried every interval, so only the first failure is warned about.
+  bool pull_failing = false;
+  bool write_failing = false;
   while (!interrupted()) {
-    dist.pullUpdates();
-    if (dist.getPendingQueryCount() > 0) {
-      dist.runQueries();
-    }
+    logFailure("pull distributed queries", dist.pullUpdates(), pull_failing);
+    logFailure(
+        "write distributed query results", dist.runQueries(), write_failing);
+    dist.cleanupExpiredRunningQueries();
 
     std::string accelerate_checkins_expire_str = "-1";
     Status status = getDatabaseValue(kPersistentSettings,

@@ -49,10 +49,29 @@ FLAG(bool,
      false,
      "Disable status logs processing");
 
+FLAG(string, aws_kinesis_endpoint, "", "Custom Kinesis endpoint");
+
+FLAG(string,
+     aws_kinesis_region,
+     "",
+     "Region to use for Kinesis instead of the default. This takes precedence "
+     "over the aws_region flag")
+
 Status KinesisLoggerPlugin::setUp() {
   initAwsSdk();
-  forwarder_ = std::make_shared<KinesisLogForwarder>(
-      "aws_kinesis", FLAGS_aws_kinesis_period, 500);
+
+  auto aws_region_res = AWSRegion::make(FLAGS_aws_kinesis_region,
+                                        FLAGS_aws_kinesis_endpoint.empty());
+
+  if (aws_region_res.isError()) {
+    return Status::failure(aws_region_res.getError().getMessage());
+  }
+
+  forwarder_ = std::make_shared<KinesisLogForwarder>("aws_kinesis",
+                                                     FLAGS_aws_kinesis_period,
+                                                     500,
+                                                     FLAGS_aws_kinesis_endpoint,
+                                                     aws_region_res.get());
   Status s = forwarder_->setUp();
   if (!s.ok()) {
     LOG(ERROR) << "Error initializing Kinesis logger: " << s.getMessage();
@@ -147,4 +166,4 @@ KinesisLogForwarder::Result KinesisLogForwarder::getResult(
     Outcome& outcome) const {
   return outcome.GetResult().GetRecords();
 }
-}
+} // namespace osquery

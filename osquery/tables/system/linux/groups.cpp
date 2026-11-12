@@ -13,46 +13,58 @@
 
 #include <osquery/core/core.h>
 #include <osquery/core/tables.h>
-#include <osquery/utils/mutex.h>
+#include <osquery/worker/ipc/platform_table_container_ipc.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
 
 namespace osquery {
 namespace tables {
 
-Mutex grpEnumerationMutex;
-
 void setGroupRow(Row& r, const group* grp) {
-  r["groupname"] = TEXT(grp->gr_name);
+  r["groupname"] = SQL_TEXT(grp->gr_name);
   r["gid"] = INTEGER(grp->gr_gid);
   r["gid_signed"] = INTEGER((int32_t)grp->gr_gid);
+  r["pid_with_namespace"] = "0";
 }
 
-QueryData genGroups(QueryContext& context) {
+QueryData genGroupsImpl(QueryContext& context, Logger& logger) {
   QueryData results;
-  struct group* grp = nullptr;
+  struct group* grp_result{nullptr};
+  struct group grp;
 
+  size_t bufsize = 16384;
+  auto buf = std::make_unique<char[]>(bufsize);
   if (context.constraints["gid"].exists(EQUALS)) {
     auto gids = context.constraints["gid"].getAll<long long>(EQUALS);
     for (const auto& gid : gids) {
-      grp = getgrgid(gid);
-      if (grp == nullptr) {
+      while (getgrgid_r(gid, &grp, buf.get(), bufsize, &grp_result) == ERANGE) {
+        bufsize *= 2;
+        buf = std::make_unique<char[]>(bufsize);
+      }
+      if (grp_result == nullptr) {
         continue;
       }
 
       Row r;
-      setGroupRow(r, grp);
+      setGroupRow(r, grp_result);
       results.push_back(r);
     }
   } else {
     std::set<long> groups_in;
-    WriteLock lock(grpEnumerationMutex);
     setgrent();
-    while ((grp = getgrent()) != nullptr) {
-      if (std::find(groups_in.begin(), groups_in.end(), grp->gr_gid) ==
+    while (1) {
+      while (getgrent_r(&grp, buf.get(), bufsize, &grp_result) == ERANGE) {
+        bufsize *= 2;
+        buf = std::make_unique<char[]>(bufsize);
+      }
+      if (grp_result == nullptr) {
+        break;
+      }
+      if (std::find(groups_in.begin(), groups_in.end(), grp_result->gr_gid) ==
           groups_in.end()) {
         Row r;
-        setGroupRow(r, grp);
+        setGroupRow(r, grp_result);
         results.push_back(r);
-        groups_in.insert(grp->gr_gid);
+        groups_in.insert(grp_result->gr_gid);
       }
     }
     endgrent();
@@ -60,6 +72,15 @@ QueryData genGroups(QueryContext& context) {
   }
 
   return results;
+}
+
+QueryData genGroups(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "groups", genGroupsImpl);
+  } else {
+    GLOGLogger logger;
+    return genGroupsImpl(context, logger);
+  }
 }
 } // namespace tables
 } // namespace osquery

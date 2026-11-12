@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <boost/property_tree/ptree.hpp>
 
 #include <osquery/core/tables.h>
@@ -28,12 +29,23 @@ namespace tables {
 /// One of the possible Chrome-based browser names
 enum class ChromeBrowserType {
   GoogleChrome,
+  GoogleChromeBeta,
+  GoogleChromeDev,
+  GoogleChromeCanary,
   Brave,
+  BraveBeta,
+  BraveNightly,
   Chromium,
   Yandex,
   Opera,
   Edge,
-  EdgeBeta
+  EdgeBeta,
+  EdgeDev,
+  EdgeCanary,
+  Vivaldi,
+  Arc,
+  Dia,
+  PerplexityComet,
 };
 
 /// Converts the browser type to a printable string
@@ -118,6 +130,9 @@ struct ChromeProfile final {
 
     /// The 'matches' entries inside 'content_scripts'
     ContentScriptsEntryList content_scripts_matches;
+
+    /// The extension id, computed from the 'key' property
+    boost::optional<std::string> opt_computed_identifier;
   };
 
   /// A list of extensions
@@ -137,6 +152,16 @@ struct ChromeProfile final {
 
   /// A list of extensions associated with this profile
   ExtensionList extension_list;
+
+  /// The display name of the default search engine, if set
+  boost::optional<std::string> search_engine_name;
+
+  /// The keyword used to trigger the default search engine from the
+  /// address bar, if set
+  boost::optional<std::string> search_engine_keyword;
+
+  /// The URL template used by the default search engine, if set
+  boost::optional<std::string> search_engine_url;
 };
 
 /// A list of Chrome profiles
@@ -194,6 +219,19 @@ using ExpectedUnixTimestamp = Expected<std::int64_t, ConversionError>;
 
 /// Converts a timestamp from Webkit to Unix format
 ExpectedUnixTimestamp webkitTimeToUnixTimestamp(const std::string& timestamp);
+
+enum class ExtensionKeyError {
+  MissingProperty,
+  InvalidValue,
+  HashingError,
+  TransformationError,
+};
+
+using ExpectedExtensionKey = Expected<std::string, ExtensionKeyError>;
+
+/// Computes the extension id based on the given key
+ExpectedExtensionKey computeExtensionIdentifier(
+    const ChromeProfile::Extension& extension);
 
 } // namespace tables
 

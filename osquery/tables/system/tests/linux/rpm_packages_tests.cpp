@@ -25,6 +25,8 @@
 #include <boost/filesystem.hpp>
 #include <boost/optional.hpp>
 
+#include <cstdlib>
+#include <string>
 #include <utility>
 
 using namespace testing;
@@ -195,6 +197,76 @@ TEST_F(RpmTests, test_sqlite_packages) {
 
   EXPECT_EQ(expected, packages);
 };
+
+TEST_F(RpmTests, test_ndb_packages) {
+  auto dropper = DropPrivileges::get();
+  if (isUserAdmin()) {
+    ASSERT_TRUE(dropper->dropTo("nobody"));
+  }
+
+  auto ndb_config = getTestConfigDirectory() / "rpm" / "rpm-ndb";
+  ndb_config = boost::filesystem::absolute(ndb_config);
+  this->setConfig(ndb_config.string());
+
+  std::vector<struct PackageDetails> packages;
+  auto getPackage = [&packages](struct PackageDetails& pd) {
+    packages.push_back(pd);
+  };
+
+  ASSERT_TRUE(queryRpmDb(getPackage).ok());
+
+  std::vector<struct PackageDetails> expected = {
+      {"binutils", "2.35.1", "2e706f0d18f426555620350d5c665f834ae20317"},
+      {"zlib-devel", "1.2.11", "202827943881ba133a7e8ca91290dcc71083a8e1"},
+      {"ncurses-devel", "6.1", "04c2780ee303bc28ca3568233fe7310d964d3b0c"}};
+
+  EXPECT_EQ(expected, packages);
+};
+
+namespace {
+
+// Expand an RPM macro expression.
+std::string expandRpmMacros(const std::string& expression) {
+  auto expanded = rpmExpand(expression.c_str(), nullptr);
+  std::string result = (expanded != nullptr) ? expanded : "";
+  free(expanded);
+  return result;
+}
+
+} // namespace
+
+// %(...) shell command macros must never run a command, since osquery reads
+// RPM configuration from untrusted sources such as containers.
+TEST_F(RpmTests, test_shell_macros_do_not_run) {
+  auto marker =
+      boost::filesystem::temp_directory_path() /
+      boost::filesystem::unique_path("osquery-rpm-shell-macro-%%%%%%%%");
+  ASSERT_FALSE(boost::filesystem::exists(marker));
+  const auto command = "%(touch " + marker.string() + ")";
+
+  EXPECT_EQ(expandRpmMacros(command), "");
+  EXPECT_FALSE(boost::filesystem::exists(marker));
+
+  // Macros defined in a macros file are expanded when they are used.
+  addMacro(nullptr, "osquery_test_shell", nullptr, command.c_str(), 0);
+  EXPECT_EQ(expandRpmMacros("%{osquery_test_shell}"), "");
+  delMacro(nullptr, "osquery_test_shell");
+  EXPECT_FALSE(boost::filesystem::exists(marker));
+
+  boost::system::error_code ec;
+  boost::filesystem::remove(marker, ec);
+}
+
+// A disabled shell command macro expands to nothing, and the rest of the
+// expression is still expanded.
+TEST_F(RpmTests, test_shell_macros_keep_surrounding_text) {
+  EXPECT_EQ(expandRpmMacros("/var/%(echo x)lib/rpm"), "/var/lib/rpm");
+
+  addMacro(nullptr, "osquery_test_path", nullptr, "/var/%(echo x)lib/rpm", 0);
+  EXPECT_EQ(expandRpmMacros("%{osquery_test_path}/Packages"),
+            "/var/lib/rpm/Packages");
+  delMacro(nullptr, "osquery_test_path");
+}
 
 } // namespace tables
 } // namespace osquery

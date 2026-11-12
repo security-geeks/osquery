@@ -10,6 +10,7 @@
 #pragma once
 
 #include <map>
+#include <mutex>
 #include <utility>
 
 #include <boost/noncopyable.hpp>
@@ -122,6 +123,13 @@ class Flag : private boost::noncopyable {
   static std::string getDescription(const std::string& name);
 
   /*
+   * @brief Checks if the provided flag name corresponds to a CLI only flag
+   *
+   * @param name the flag name
+   */
+  static bool isCLIOnlyFlag(const std::string& name);
+
+  /*
    * @brief Print help-style output to stdout for a given flag set.
    *
    * @param shell Only print shell flags.
@@ -130,6 +138,14 @@ class Flag : private boost::noncopyable {
   static void printFlags(bool shell = false,
                          bool external = false,
                          bool cli = false);
+
+  /**
+   * @brief Clear up the custom flags
+   * Currently used by the fuzzer targets to prevent
+   * the map size to increase indefinitely
+   *
+   */
+  static void resetCustomFlags();
 
  private:
   /// The container of all shell, CLI, and normal flags.
@@ -140,6 +156,9 @@ class Flag : private boost::noncopyable {
 
   /// Configurations may set "custom_" flags.
   std::map<std::string, std::string> custom_;
+
+  /// Protects custom flag lookup, copying, mutation and reset.
+  std::mutex custom_mutex_;
 };
 } // namespace osquery
 

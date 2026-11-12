@@ -229,7 +229,7 @@ std::string NormalizePath(const std::string& cwd,
   */
 
   boostfs::path normalized_path(translated_path);
-  normalized_path = normalized_path.normalize();
+  normalized_path = normalized_path.lexically_normal();
 
   return normalized_path.string();
 };
@@ -1062,8 +1062,8 @@ bool AuditSyscallRecordHandler(AuditdFimContext& fim_context,
   }
 
   switch (syscall_context.syscall_number) {
-  // The following syscalls are only handled to duplicate and/or create the fd
-  // map
+    // The following syscalls are only handled to duplicate and/or create the fd
+    // map
 #ifdef __x86_64__
   case __NR_fork:
   case __NR_vfork:
@@ -1160,20 +1160,18 @@ bool AuditSyscallRecordHandler(AuditdFimContext& fim_context,
         fim_context, syscall_context, record);
   }
 
-  default: { return false; }
+  default: {
+    return false;
+  }
   }
 }
 } // namespace
 
-Status ProcessFileEventSubscriber::setUp() {
+Status ProcessFileEventSubscriber::init() {
   if (!FLAGS_audit_allow_fim_events) {
     return Status(1, "Subscriber disabled via configuration");
   }
 
-  return Status(0);
-}
-
-Status ProcessFileEventSubscriber::init() {
   auto sc = createSubscriptionContext();
   subscribe(&ProcessFileEventSubscriber::Callback, sc);
 
@@ -1230,6 +1228,10 @@ Status ProcessFileEventSubscriber::ProcessEvents(
     }
 
     const auto& event_data = boost::get<SyscallAuditEventData>(event.data);
+    if (!event_data.succeeded) {
+      continue;
+    }
+
     if (!L_ShouldHandle(event_data.syscall_number)) {
       continue;
     }
@@ -1536,10 +1538,17 @@ void AuditdFimProcessMap::save(
   if (process_it == data_.end()) {
     process_it = data_.insert({process_id, AuditdFimFdMap(process_id)}).first;
 
-    // Try to limit the amount of processes we are tracking. When
-    // removing, start from the oldest ones
+    // Try to limit the amount of processes we are tracking. When the map
+    // grows too large, evict the entry with the smallest PID (note:
+    // std::map is ordered by key, not insertion order). If the
+    // just-inserted entry happens to be the minimum, skip eviction this
+    // round rather than discarding tracking state for another live process;
+    // the map will be trimmed on the next insertion.
     if (data_.size() > 4096) {
-      data_.erase(data_.begin());
+      auto victim = data_.begin();
+      if (victim != process_it) {
+        data_.erase(victim);
+      }
     }
   }
 

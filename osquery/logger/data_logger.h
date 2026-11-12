@@ -22,6 +22,8 @@
 
 namespace osquery {
 
+enum class LoggerRelayMode { Sync, Async };
+
 /// Set the verbose mode, changes Glog's sinking logic and will affect plugins.
 void setVerboseLevel();
 
@@ -120,13 +122,19 @@ Status logSnapshotQuery(const QueryLogItem& item);
  * Extensions, the registry, configuration, and optional config/logger plugins
  * are all protected as a monitored worker.
  */
-void relayStatusLogs(bool async = false);
+void relayStatusLogs(LoggerRelayMode relay_mode = LoggerRelayMode::Sync);
+
+/**
+ * @brief Waits for the relay thread to finish
+ *
+ * Waits for the new relay thread launched by the relayStatusLogs function,
+ * called previously on the current thread, to finish.
+ * Must not be called in a path that can be called by Google Log.
+ */
+void waitLogRelay();
 
 /// Inspect the number of internal-buffered status log lines.
 size_t queuedStatuses();
-
-/// Inspect the number of active internal status log sender threads.
-size_t queuedSenders();
 
 /**
  * @brief Write a log line to the OS system log.
@@ -140,4 +148,14 @@ size_t queuedSenders();
  * Event Log.
  */
 void systemLog(const std::string& line);
+
+/**
+ * @brief Construct a custom prefix for each google log line
+ *
+ * With newer Google Log versions the log lines have acquired the year in their
+ * prefix. We want to use the old format without it for now.
+ */
+void googleLogCustomPrefix(std::ostream& s,
+                           const LogMessageInfo& l,
+                           void* data);
 } // namespace osquery

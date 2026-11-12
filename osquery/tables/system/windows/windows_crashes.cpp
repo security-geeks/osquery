@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
+#include <osquery/utils/system/env.h>
 #include <osquery/utils/system/system.h>
 
 #include <Winternl.h>
@@ -614,36 +615,53 @@ void processDebugEngine(const std::string& fileName, Row& r) {
 QueryData genCrashLogs(QueryContext& context) {
   const std::string kDumpFileExtension = ".dmp";
   QueryData results;
-  std::string dumpFolderLocation{""};
+  std::string userModeDumpFolderLocation{""};
+  std::vector<std::string> dumpFolderLocations;
 
   // Query registry for crash dump folder
-  std::string dumpFolderQuery =
+  std::string userModeDumpFolderQuery =
       "SELECT data FROM registry WHERE path = \"" + kLocalDumpsRegKey + "\"";
-  SQL dumpFolderResults(dumpFolderQuery);
-  if (!dumpFolderResults.rows().empty()) {
-    dumpFolderLocation = dumpFolderResults.rows()[0].at("data");
-  } else {
-    auto tempDumpLoc = getEnvVar("TMP");
-    dumpFolderLocation = tempDumpLoc.is_initialized() ? *tempDumpLoc : "";
+
+  SQL userModeDumpFolderResults(userModeDumpFolderQuery);
+  if (!userModeDumpFolderResults.rows().empty()) {
+    dumpFolderLocations.push_back(
+        userModeDumpFolderResults.rows()[0].at("data"));
   }
 
-  if (!fs::exists(dumpFolderLocation) ||
-      !fs::is_directory(dumpFolderLocation)) {
-    VLOG(1) << "No crash dump directory found";
-    return results;
+  auto tempDumpLoc = getEnvVar("LOCALAPPDATA");
+  userModeDumpFolderLocation = tempDumpLoc.is_initialized() ? *tempDumpLoc : "";
+
+  if (!userModeDumpFolderLocation.empty()) {
+    const std::string crashDumpFolder = "CrashDumps";
+    userModeDumpFolderLocation += "\\";
+    userModeDumpFolderLocation += crashDumpFolder;
+    dumpFolderLocations.push_back(userModeDumpFolderLocation);
   }
 
-  // Enumerate and process crash dumps
-  std::vector<std::string> files;
-  if (listFilesInDirectory(dumpFolderLocation, files)) {
-    for (const auto& lf : files) {
-      if (alg::iends_with(lf, kDumpFileExtension) && fs::is_regular_file(lf)) {
-        Row r;
-        processDebugEngine(lf, r);
-        if (!r.empty()) {
-          results.push_back(r);
+  // Process each potential dump folder
+  for (auto& dumpFolderLocation : dumpFolderLocations) {
+    if (const auto expandedPath = expandEnvString(dumpFolderLocation)) {
+      dumpFolderLocation = *expandedPath;
+    }
+
+    if (fs::exists(dumpFolderLocation) &&
+        fs::is_directory(dumpFolderLocation)) {
+      std::vector<std::string> files;
+      if (listFilesInDirectory(dumpFolderLocation, files)) {
+        for (const auto& lf : files) {
+          if (alg::iends_with(lf, kDumpFileExtension) &&
+              fs::is_regular_file(lf)) {
+            Row r;
+            processDebugEngine(lf, r);
+            if (!r.empty()) {
+              results.push_back(r);
+            }
+          }
         }
       }
+    } else {
+      VLOG(1) << "Dump folder not found or not a directory: "
+              << dumpFolderLocation;
     }
   }
 

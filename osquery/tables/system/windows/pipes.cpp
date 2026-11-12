@@ -37,8 +37,19 @@ QueryData genPipes(QueryContext& context) {
 
     unsigned long pid = 0;
     auto pipePath = L"\\\\.\\pipe\\" + std::wstring(findFileData.cFileName);
-    auto pipeHandle = CreateFileW(
-        pipePath.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    // Open the pipe with an explicit Security Quality of Service level as
+    // defense-in-depth: SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION lets
+    // the pipe server identify this client but prevents it from impersonating
+    // the (potentially privileged) osquery process. Without an explicit SQOS
+    // the server could request impersonation-level access.
+    auto pipeHandle =
+        CreateFileW(pipePath.c_str(),
+                    GENERIC_READ,
+                    (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+                    nullptr,
+                    OPEN_EXISTING,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    nullptr);
     if (pipeHandle == INVALID_HANDLE_VALUE) {
       results.push_back(r);
       LOG(INFO) << "Failed to open handle to pipe with " << GetLastError();

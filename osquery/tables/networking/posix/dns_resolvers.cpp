@@ -15,11 +15,13 @@
 #include <osquery/core/tables.h>
 #include <osquery/logger/logger.h>
 #include <osquery/tables/networking/posix/utils.h>
+#include <osquery/worker/ipc/platform_table_container_ipc.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
 
 namespace osquery {
 namespace tables {
 
-QueryData genDNSResolvers(QueryContext& context) {
+QueryData genDNSResolversImpl(QueryContext& context, Logger& logger) {
   QueryData results;
 
   // libresolv will populate a global structure with resolver information.
@@ -40,6 +42,7 @@ QueryData genDNSResolvers(QueryContext& context) {
       r["netmask"] = "32";
       // Options applies to every resolver.
       r["options"] = BIGINT(_res.options);
+      r["pid_with_namespace"] = "0";
       results.push_back(r);
     }
   }
@@ -53,6 +56,7 @@ QueryData genDNSResolvers(QueryContext& context) {
           ipAsString((const struct sockaddr*)&_res.sort_list[i].addr);
       r["netmask"] = INTEGER(_res.sort_list[i].mask);
       r["options"] = BIGINT(_res.options);
+      r["pid_with_namespace"] = "0";
       results.push_back(r);
     }
   }
@@ -62,14 +66,24 @@ QueryData genDNSResolvers(QueryContext& context) {
       Row r;
       r["id"] = INTEGER(i);
       r["type"] = "search";
-      r["address"] = std::string(_res.dnsrch[0]);
+      r["address"] = std::string(_res.dnsrch[i]);
       r["options"] = BIGINT(_res.options);
+      r["pid_with_namespace"] = "0";
       results.push_back(r);
     }
   }
 
   res_close();
   return results;
+}
+
+QueryData genDNSResolvers(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "dns_resolvers", genDNSResolversImpl);
+  } else {
+    GLOGLogger logger;
+    return genDNSResolversImpl(context, logger);
+  }
 }
 }
 }

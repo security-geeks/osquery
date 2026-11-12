@@ -35,7 +35,7 @@ function(generateOsqueryDispatcher)
 
   generateIncludeNamespace(osquery_dispatcher "osquery/dispatcher" "FILE_ONLY" ${public_header_files})
 
-  add_test(NAME osquery_dispatcher_tests-test COMMAND osquery_dispatcher_tests-test)
+  add_test(NAME osquery_dispatcher_tests_mergedtests-test COMMAND osquery_dispatcher_tests_mergedtests-test)
 endfunction()
 
 function(generateOsqueryDistributedAndScheduler)
@@ -56,6 +56,7 @@ function(generateOsqueryDistributedAndScheduler)
     osquery_sql
     osquery_utils
     osquery_utils_conversions
+    osquery_worker_system_linux_memory
     plugins_config_parsers
     thirdparty_boost
     thirdparty_googletest_headers
@@ -67,8 +68,6 @@ function(generateOsqueryDistributedAndScheduler)
   )
 
   generateIncludeNamespace(osquery_dispatcher_scheduler "osquery/dispatcher" "FILE_ONLY" ${public_header_files})
-
-  add_test(NAME osquery_dispatcher_tests_scheduler-test COMMAND osquery_dispatcher_tests_scheduler-test)
 endfunction()
 
 osqueryDispatcherMain()

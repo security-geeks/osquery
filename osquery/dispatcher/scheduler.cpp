@@ -7,11 +7,14 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
+#include "osquery/dispatcher/scheduler.h"
+
 #include <algorithm>
 #include <ctime>
+#include <optional>
 
 #include <boost/format.hpp>
-#include <boost/io/detail/quoted_manip.hpp>
+#include <boost/io/quoted.hpp>
 
 #include <osquery/carver/carver.h>
 #include <osquery/config/config.h>
@@ -24,12 +27,11 @@
 #include <osquery/numeric_monitoring/numeric_monitoring.h>
 #include <osquery/process/process.h>
 #include <osquery/profiler/code_profiler.h>
-
+#include <osquery/sql/sqlite_util.h>
+#include <osquery/utils/expected/expected.h>
 #include <osquery/utils/system/time.h>
-
-#include "osquery/dispatcher/scheduler.h"
-#include "osquery/sql/sqlite_util.h"
-#include "plugins/config/parsers/decorators.h"
+#include <osquery/worker/system/memory.h>
+#include <plugins/config/parsers/decorators.h>
 
 namespace osquery {
 
@@ -63,45 +65,56 @@ DECLARE_bool(enable_numeric_monitoring);
 DECLARE_bool(verbose);
 
 SQLInternal monitor(const std::string& name, const ScheduledQuery& query) {
+  // Snapshot the performance and times for the worker before running.
+  auto pid = std::to_string(PlatformProcess::getCurrentPid());
+  auto r0 = SQL::selectFrom({"resident_size", "user_time", "system_time"},
+                            "processes",
+                            "pid",
+                            EQUALS,
+                            pid);
+
+  using namespace std::chrono;
+  auto t0 = steady_clock::now();
+  Config::get().recordQueryStart(name);
+
+  // Numeric monitoring, when enabled, also profiles the query. It is in
+  // addition to the performance recorded below, which osquery_schedule reports
+  // and the watchdog uses to find a query that crashed the worker.
+  std::optional<CodeProfiler> profiler;
   if (FLAGS_enable_numeric_monitoring) {
-    CodeProfiler profiler(
-        {(boost::format("scheduler.pack.%s") % query.pack_name).str(),
-         (boost::format("scheduler.global.query.%s.%s") % query.pack_name %
-          query.name)
-             .str(),
-         (boost::format("scheduler.assigned.query.%s.%s.%s") % query.oncall %
-          query.pack_name % query.name)
-             .str(),
-         (boost::format("scheduler.owners.%s") % query.oncall).str(),
-         (boost::format("scheduler.query.%s.%s.%s") %
-          monitoring::hostIdentifierKeys().scheme % query.pack_name %
-          query.name)
-             .str()});
-    return SQLInternal(query.query, true);
-  } else {
-    // Snapshot the performance and times for the worker before running.
-    auto pid = std::to_string(PlatformProcess::getCurrentPid());
-    auto r0 = SQL::selectFrom({"resident_size", "user_time", "system_time"},
-                              "processes",
-                              "pid",
-                              EQUALS,
-                              pid);
-    auto t0 = getUnixTime();
-    Config::get().recordQueryStart(name);
-    SQLInternal sql(query.query, true);
-    // Snapshot the performance after, and compare.
-    auto t1 = getUnixTime();
-    auto r1 = SQL::selectFrom({"resident_size", "user_time", "system_time"},
-                              "processes",
-                              "pid",
-                              EQUALS,
-                              pid);
-    if (r0.size() > 0 && r1.size() > 0) {
-      // Always called while processes table is working.
-      Config::get().recordQueryPerformance(name, t1 - t0, r0[0], r1[0]);
-    }
-    return sql;
+    profiler.emplace(std::initializer_list<std::string>{
+        (boost::format("scheduler.pack.%s") % query.pack_name).str(),
+        (boost::format("scheduler.global.query.%s.%s") % query.pack_name %
+         query.name)
+            .str(),
+        (boost::format("scheduler.assigned.query.%s.%s.%s") % query.oncall %
+         query.pack_name % query.name)
+            .str(),
+        (boost::format("scheduler.owners.%s") % query.oncall).str(),
+        (boost::format("scheduler.query.%s.%s.%s") %
+         monitoring::hostIdentifierKeys().scheme % query.pack_name % query.name)
+            .str()});
   }
+  SQLInternal sql(query.query, true);
+  // Take the end time before the profile is reported, so the query's wall time
+  // does not include recording the numeric monitoring points.
+  auto t1 = steady_clock::now();
+  // Report the profile for the query alone.
+  profiler.reset();
+
+  // Snapshot the performance after, and compare.
+  auto r1 = SQL::selectFrom({"resident_size", "user_time", "system_time"},
+                            "processes",
+                            "pid",
+                            EQUALS,
+                            pid);
+  if (r0.size() > 0 && r1.size() > 0) {
+    // Always called while processes table is working.
+    uint64_t size = sql.getSize();
+    Config::get().recordQueryPerformance(
+        name, duration_cast<milliseconds>(t1 - t0).count(), size, r0[0], r1[0]);
+  }
+  return sql;
 }
 
 Status launchQuery(const std::string& name, const ScheduledQuery& query) {
@@ -131,14 +144,28 @@ Status launchQuery(const std::string& name, const ScheduledQuery& query) {
   item.time = osquery::getUnixTime();
   item.epoch = FLAGS_schedule_epoch;
   item.calendar_time = osquery::getAsciiTime();
+  item.isSnapshot = false;
   getDecorations(item.decorations);
 
   if (query.isSnapshotQuery()) {
-    // This is a snapshot query, emit results with a differential or state.
+    // This is a snapshot query, emit results without a differential or state.
+    item.isSnapshot = true;
     item.snapshot_results = std::move(sql.rowsTyped());
-    logSnapshotQuery(item);
-    return Status::success();
+    auto status = logSnapshotQuery(item);
+    if (!status.ok()) {
+      // If log directory is not available, then the daemon shouldn't continue.
+      std::string message = "Error logging the results of query: " + name +
+                            ": " + status.toString();
+      requestShutdown(EXIT_CATASTROPHIC, message);
+    }
+    return status;
   }
+
+  // Set counter to 1 here to be able to tell if this was a new epoch
+  // (counter=0) in the differential stream. Whenever actually logging
+  // results below, this counter value will have been overwritten in
+  // addNewResults or addNewEvents.
+  item.counter = 1;
 
   // Create a database-backed set of query results.
   auto dbQuery = Query(name, query);
@@ -168,8 +195,9 @@ Status launchQuery(const std::string& name, const ScheduledQuery& query) {
     diff_results.removed.clear();
   }
 
-  if (diff_results.hasNoResults()) {
-    // No diff results or events to emit.
+  if (diff_results.hasNoResults() && item.counter != 0) {
+    // No diff results or events to emit, return unless this is a
+    // periodic snapshot (counter=0) which can emit an empty result.
     return status;
   }
 
@@ -214,6 +242,17 @@ void SchedulerRunner::maybeScheduleCarves(uint64_t time_step) {
 
 void SchedulerRunner::maybeReloadSchedule(uint64_t time_step) {
   if (FLAGS_schedule_reload > 0 && (time_step % FLAGS_schedule_reload) == 0) {
+    /* Before resetting the database we want to ensure that there's no pending
+       log relay thread started by the scheduler thread in a previous loop,
+       to avoid deadlocks.
+       This is because resetDatabase logs and also holds an exclusive lock
+       to the database, so when a log relay thread started via relayStatusLog
+       is pending, log calls done on the same thread that started it
+       (in this case the scheduler thread), will wait until the log relaying
+       thread finishes serializing the logs to the database; but this can't
+       happen due to the exclusive lock. */
+    waitLogRelay();
+
     if (FLAGS_schedule_reload_sql) {
       SQLiteDBManager::resetPrimary();
     }
@@ -222,9 +261,16 @@ void SchedulerRunner::maybeReloadSchedule(uint64_t time_step) {
 }
 
 void SchedulerRunner::maybeFlushLogs(uint64_t time_step) {
-  // GLog is not re-entrant, so logs must be flushed in a dedicated thread.
+  /* In daemon mode we start a log relay thread to flush the logs from the
+     BufferedLogSink to the database.
+     The thread is started from the scheduler thread,
+     since if we did it in the send() function of BufferedLogSink,
+     inline to the log call itself, we would cause deadlocks
+     if there's recursive logging caused by the logger plugins.
+     We do the flush itself also in a new thread so we don't slow down
+     the scheduler thread too much */
   if ((time_step % 3) == 0) {
-    relayStatusLogs(true);
+    relayStatusLogs(LoggerRelayMode::Async);
   }
 }
 
@@ -234,11 +280,21 @@ void SchedulerRunner::start() {
   // Timeout is the number of seconds from starting.
   auto end = (timeout_ == 0) ? 0 : timeout_ + i;
 
+  // A set of query names which have run for the first time.
+  std::unordered_set<std::string> first_query_runs;
+
   for (; (end == 0) || (i <= end); ++i) {
     auto start_time_point = std::chrono::steady_clock::now();
-    Config::get().scheduledQueries(([&i](const std::string& name,
-                                         const ScheduledQuery& query) {
-      if (query.splayed_interval > 0 && i % query.splayed_interval == 0) {
+    Config::get().scheduledQueries(([&i, &first_query_runs](
+                                        const std::string& name,
+                                        const ScheduledQuery& query) {
+      bool query_has_not_run =
+          first_query_runs.find(name) == first_query_runs.end();
+      if ((query.splayed_interval > 0 && i % query.splayed_interval == 0) ||
+          (query.startup_priority != UINT64_MAX && query_has_not_run)) {
+        if (query_has_not_run) {
+          first_query_runs.insert(name);
+        }
         TablePlugin::kCacheInterval = query.splayed_interval;
         TablePlugin::kCacheStep = i;
         const auto status = launchQuery(name, query);
@@ -249,6 +305,11 @@ void SchedulerRunner::start() {
                            1,
                            monitoring::PreAggregationType::Sum,
                            true);
+
+#ifdef OSQUERY_LINUX
+        // Attempt to release some unused memory kept by malloc internal caching
+        releaseRetainedMemory();
+#endif
       }
     }));
 
@@ -265,6 +326,10 @@ void SchedulerRunner::start() {
       break;
     }
   }
+
+  /* Wait for the thread relaying/flushing the logs,
+     to prevent race conditions on shutdown */
+  waitLogRelay();
 
   // Scheduler ended.
   if (!interrupted() && request_shutdown_on_expiration) {

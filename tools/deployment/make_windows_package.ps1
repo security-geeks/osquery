@@ -425,12 +425,12 @@ function New-ChocolateyPackage() {
     <copyright>Copyright (c) 2014-present, The osquery authors. See LICENSE file found in the
 # root directory of this source tree.</copyright>
     <projectUrl>https://osquery.io</projectUrl>
-    <iconUrl>https://github.com/osquery/osquery/blob/master/tools/osquery.ico</iconUrl>
+    <iconUrl>https://raw.githubusercontent.com/osquery/osquery/master/tools/deployment/windows_packaging/osquery.ico</iconUrl>
     <licenseUrl>https://github.com/osquery/osquery/blob/master/LICENSE</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <projectSourceUrl>https://github.com/osquery/osquery</projectSourceUrl>
     <docsUrl>https://osquery.readthedocs.io/en/stable</docsUrl>
-    <mailingListUrl>https://join.slack.com/t/osquery/shared_invite/zt-h29zm0gk-s2DBtGUTW4CFel0f0IjTEw</mailingListUrl>
+    <mailingListUrl>https://join.slack.com/t/osquery/shared_invite/zt-1wipcuc04-DBXmo51zYJKBu3_EP3xZPA</mailingListUrl>
     <bugTrackerUrl>https://github.com/osquery/osquery/issues</bugTrackerUrl>
     <tags>InfoSec Tools</tags>
     <summary>

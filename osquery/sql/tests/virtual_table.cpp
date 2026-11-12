@@ -21,7 +21,7 @@
 
 namespace osquery {
 
-DECLARE_bool(table_exceptions);
+DECLARE_bool(ignore_table_exceptions);
 
 class VirtualTableTests : public testing::Test {
  public:
@@ -204,6 +204,101 @@ TEST_F(VirtualTableTests, test_tableplugin_aliases) {
   EXPECT_EQ(expected_statement, columnDefinition(response, false, false));
 }
 
+class hiddenAliasTablePlugin : public TablePlugin {
+ private:
+  TableColumns columns() const override {
+    return {
+        std::make_tuple("path", TEXT_TYPE, ColumnOptions::DEFAULT),
+        std::make_tuple("rule",
+                        TEXT_TYPE,
+                        ColumnOptions::ADDITIONAL | ColumnOptions::HIDDEN),
+    };
+  }
+
+  std::vector<std::string> aliases() const override {
+    return {"hidden_alias"};
+  }
+
+ public:
+  TableRows generate(QueryContext& context) override {
+    // Only return rows for the rule constraints, like yara.
+    TableRows results;
+    for (const auto& rule : context.constraints["rule"].getAll(EQUALS)) {
+      auto r = make_table_row();
+      r["path"] = "p";
+      r["rule"] = rule;
+      results.push_back(std::move(r));
+    }
+    return results;
+  }
+};
+
+TEST_F(VirtualTableTests, test_table_alias_hidden_columns) {
+  auto tables = RegistryFactory::get().registry("table");
+  tables->add("hidden_table", std::make_shared<hiddenAliasTablePlugin>());
+  auto dbc = SQLiteDBManager::getUnique();
+
+  for (const std::string name : {"hidden_table", "hidden_alias"}) {
+    // SELECT * leaves out the hidden column, but it can still be constrained.
+    QueryData all;
+    auto status =
+        queryInternal("SELECT * FROM " + name + " WHERE rule = 'r'", all, dbc);
+    ASSERT_TRUE(status.ok()) << name << ": " << status.getMessage();
+    EXPECT_EQ(all, QueryData({{{"path", "p"}}})) << name;
+
+    QueryData rule;
+    status = queryInternal(
+        "SELECT rule FROM " + name + " WHERE rule = 'r'", rule, dbc);
+    ASSERT_TRUE(status.ok()) << name << ": " << status.getMessage();
+    EXPECT_EQ(rule, QueryData({{{"rule", "r"}}})) << name;
+  }
+
+  // Detaching the table removes its alias too, attaching adds it back.
+  ASSERT_TRUE(detachTableInternal("hidden_table", dbc).ok());
+  QueryData results;
+  EXPECT_FALSE(
+      queryInternal("SELECT * FROM hidden_alias WHERE rule = 'r'", results, dbc)
+          .ok());
+  ASSERT_TRUE(attachTableInternal("hidden_table", dbc, false).ok());
+  EXPECT_TRUE(
+      queryInternal("SELECT * FROM hidden_alias WHERE rule = 'r'", results, dbc)
+          .ok());
+}
+
+TEST_F(VirtualTableTests, test_table_alias_planner_tables) {
+  auto tables = RegistryFactory::get().registry("table");
+  tables->add("hidden_table", std::make_shared<hiddenAliasTablePlugin>());
+  auto dbc = SQLiteDBManager::getUnique();
+
+  // Event subscribers are looked up by the canonical table name.
+  QueryPlanner planner("SELECT path FROM hidden_alias", dbc);
+  EXPECT_EQ(planner.tables(), std::vector<std::string>{"hidden_table"});
+}
+
+TEST_F(VirtualTableTests, test_table_alias_affected_tables) {
+  auto tables = RegistryFactory::get().registry("table");
+  tables->add("hidden_table", std::make_shared<hiddenAliasTablePlugin>());
+  auto dbc = SQLiteDBManager::getUnique();
+
+  QueryData results;
+  ASSERT_TRUE(queryInternal("SELECT * FROM hidden_table WHERE rule = 'r' UNION "
+                            "ALL SELECT * FROM hidden_alias WHERE rule = 'r'",
+                            results,
+                            dbc)
+                  .ok());
+
+  // Both tables' planning state is cleared, not just one of them.
+  std::vector<std::shared_ptr<VirtualTableContent>> contents;
+  for (const auto& table : dbc->affected_tables_) {
+    contents.push_back(table.second);
+  }
+  ASSERT_EQ(contents.size(), 2U);
+  dbc->clearAffectedTables();
+  for (const auto& content : contents) {
+    EXPECT_TRUE(content->constraints.empty());
+  }
+}
+
 TEST_F(VirtualTableTests, test_sqlite3_attach_vtable) {
   auto table = std::make_shared<sampleTablePlugin>();
   table->setName("sample");
@@ -214,8 +309,7 @@ TEST_F(VirtualTableTests, test_sqlite3_attach_vtable) {
   auto dbc = SQLiteDBManager::get();
 
   // Virtual tables require the registry/plugin API to query tables.
-  auto status =
-      attachTableInternal("failed_sample", "(foo INTEGER)", dbc, false);
+  auto status = attachTableInternal("failed_sample", dbc, false);
   EXPECT_EQ(status.getCode(), SQLITE_ERROR);
 
   // The table attach will complete only when the table name is registered.
@@ -227,17 +321,14 @@ TEST_F(VirtualTableTests, test_sqlite3_attach_vtable) {
   ASSERT_TRUE(status.ok());
 
   // Use the table name, plugin-generated schema to attach.
-  status = attachTableInternal(
-      "sample", columnDefinition(response, false, false), dbc, false);
+  status = attachTableInternal("sample", dbc, false);
   EXPECT_EQ(status.getCode(), SQLITE_OK);
 
   std::string const q =
       "SELECT sql FROM sqlite_temp_master WHERE tbl_name='sample';";
   QueryData results;
   status = queryInternal(q, results, dbc);
-  EXPECT_EQ(
-      "CREATE VIRTUAL TABLE sample USING sample(`foo` INTEGER, `bar` TEXT)",
-      results[0]["sql"]);
+  EXPECT_EQ("CREATE VIRTUAL TABLE sample USING sample", results[0]["sql"]);
 }
 
 TEST_F(VirtualTableTests, test_sqlite3_table_joins) {
@@ -318,9 +409,9 @@ TEST_F(VirtualTableTests, test_constraints_stacking) {
   {
     // To simplify the attach, just access the column definition directly.
     auto p = std::make_shared<pTablePlugin>();
-    attachTableInternal("p", p->columnDefinition(false), dbc, false);
+    attachTableInternal("p", dbc, false);
     auto k = std::make_shared<kTablePlugin>();
-    attachTableInternal("k", k->columnDefinition(false), dbc, false);
+    attachTableInternal("k", dbc, false);
   }
 
   std::vector<std::pair<std::string, QueryData>> constraint_tests = {
@@ -403,7 +494,7 @@ TEST_F(VirtualTableTests, test_json_extract) {
   tables->add("json", json);
 
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal("json", json->columnDefinition(false), dbc, false);
+  attachTableInternal("json", dbc, false);
 
   QueryData results;
   // Run a query with a join within.
@@ -483,7 +574,7 @@ TEST_F(VirtualTableTests, test_table_cache) {
   auto cache = std::make_shared<cacheTablePlugin>();
   tables->add("cache", cache);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal("cache", cache->columnDefinition(false), dbc, false);
+  attachTableInternal("cache", dbc, false);
 
   QueryData results;
   // Run a query with a join within.
@@ -538,8 +629,7 @@ TEST_F(VirtualTableTests, test_table_results_cache) {
   auto cache = std::make_shared<tableCacheTablePlugin>();
   tables->add("table_cache", cache);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "table_cache", cache->columnDefinition(false), dbc, false);
+  attachTableInternal("table_cache", dbc, false);
 
   QueryData results;
   std::string statement = "SELECT * from table_cache;";
@@ -605,8 +695,7 @@ TEST_F(VirtualTableTests, test_table_results_cache_colcheck) {
   auto cache = std::make_shared<tableCacheTablePlugin>();
   tables->add("table_cache_cols", cache);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "table_cache_cols", cache->columnDefinition(false), dbc, false);
+  attachTableInternal("table_cache_cols", dbc, false);
 
   // Request that caching be used.
   dbc->useCache(true);
@@ -667,7 +756,7 @@ TEST_F(VirtualTableTests, test_yield_generator) {
   table_registry->add("yield", table);
 
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal("yield", table->columnDefinition(false), dbc, false);
+  attachTableInternal("yield", dbc, false);
 
   QueryData results;
   queryInternal("SELECT * from yield", results, dbc);
@@ -725,7 +814,7 @@ TEST_F(VirtualTableTests, test_like_constraints) {
   table_registry->add("like_table", table);
 
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal("like_table", table->columnDefinition(false), dbc, false);
+  attachTableInternal("like_table", dbc, false);
 
   // Base case, without constrains this table has no results.
   QueryData results;
@@ -883,16 +972,15 @@ TEST_F(VirtualTableTests, test_indexing_costs) {
 
   auto i = std::make_shared<indexIOptimizedTablePlugin>();
   table_registry->add("index_i", i);
-  attachTableInternal("index_i", i->columnDefinition(false), dbc, false);
+  attachTableInternal("index_i", dbc, false);
 
   auto j = std::make_shared<indexJOptimizedTablePlugin>();
   table_registry->add("index_j", j);
-  attachTableInternal("index_j", j->columnDefinition(false), dbc, false);
+  attachTableInternal("index_j", dbc, false);
 
   auto default_scan = std::make_shared<defaultScanTablePlugin>();
   table_registry->add("default_scan", default_scan);
-  attachTableInternal(
-      "default_scan", default_scan->columnDefinition(false), dbc, false);
+  attachTableInternal("default_scan", dbc, false);
 
   QueryData results;
   queryInternal(
@@ -974,8 +1062,7 @@ TEST_F(VirtualTableTests, test_used_columns) {
   auto colsUsed = std::make_shared<colsUsedTablePlugin>();
   tables->add("colsUsed1", colsUsed);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "colsUsed1", colsUsed->columnDefinition(false), dbc, false);
+  attachTableInternal("colsUsed1", dbc, false);
 
   QueryData results;
   auto status = queryInternal("SELECT col1, col3 FROM colsUsed1", results, dbc);
@@ -993,8 +1080,7 @@ TEST_F(VirtualTableTests, test_used_columns_with_alias) {
   auto colsUsed = std::make_shared<colsUsedTablePlugin>();
   tables->add("colsUsed2", colsUsed);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "colsUsed2", colsUsed->columnDefinition(false), dbc, false);
+  attachTableInternal("colsUsed2", dbc, false);
 
   QueryData results;
   auto status =
@@ -1051,8 +1137,7 @@ TEST_F(VirtualTableTests, test_used_columns_bitset) {
   auto colsUsed = std::make_shared<colsUsedBitsetTablePlugin>();
   tables->add("colsUsedBitset1", colsUsed);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "colsUsedBitset1", colsUsed->columnDefinition(false), dbc, false);
+  attachTableInternal("colsUsedBitset1", dbc, false);
 
   QueryData results;
   auto status =
@@ -1071,8 +1156,7 @@ TEST_F(VirtualTableTests, test_used_columns_bitset_with_alias) {
   auto colsUsed = std::make_shared<colsUsedBitsetTablePlugin>();
   tables->add("colsUsedBitset2", colsUsed);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "colsUsedBitset2", colsUsed->columnDefinition(false), dbc, false);
+  attachTableInternal("colsUsedBitset2", dbc, false);
 
   QueryData results;
   auto status =
@@ -1117,8 +1201,7 @@ TEST_F(VirtualTableTests, test_used_columns_default) {
   auto colsUsedDefault = std::make_shared<colsUsedDefaultTablePlugin>();
   tables->add("colsUsedDefault", colsUsedDefault);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "colsUsedDefault", colsUsedDefault->columnDefinition(false), dbc, false);
+  attachTableInternal("colsUsedDefault", dbc, false);
 
   {
     QueryData results;
@@ -1178,7 +1261,7 @@ TEST_F(VirtualTableTests, test_noindex_constraints) {
 
   auto tablePlugin = std::make_shared<NoConstraintTestTablePlugin>();
   table_registry->add("noco", tablePlugin);
-  attachTableInternal("noco", tablePlugin->columnDefinition(false), dbc, false);
+  attachTableInternal("noco", dbc, false);
 
   QueryData results;
   queryInternal(
@@ -1190,6 +1273,66 @@ TEST_F(VirtualTableTests, test_noindex_constraints) {
   ASSERT_EQ(1U, tablePlugin->scans);
   ASSERT_EQ(2U, results.size());
   ASSERT_EQ("0", results[1]["straints"]);
+}
+
+/*
+ * An OPTIMIZED column gets its whole IN list in one xFilter call. SQLite
+ * calls xFilter again for every outer row of a join, and for every value of
+ * an IN on another index column, and each call must still see the list.
+ * Like a required column, the table returns nothing without a name.
+ */
+struct OptimizedInTestTablePlugin : public TablePlugin {
+  TableColumns columns() const override {
+    return {
+        std::make_tuple(
+            "name", TEXT_TYPE, ColumnOptions::INDEX | ColumnOptions::OPTIMIZED),
+        std::make_tuple("id", INTEGER_TYPE, ColumnOptions::INDEX),
+    };
+  }
+
+  TableRows generate(QueryContext& context) override {
+    scans++;
+
+    TableRows tr;
+    auto ids = context.constraints["id"].getAll(EQUALS);
+    auto id = ids.empty() ? std::string("0") : *ids.begin();
+    for (const auto& name : context.constraints["name"].getAll(EQUALS)) {
+      tr.push_back(make_table_row({{"name", name}, {"id", id}}));
+    }
+    return tr;
+  }
+
+  size_t scans{0};
+};
+
+TEST_F(VirtualTableTests, test_optimized_in_constraint_reused) {
+  auto dbc = SQLiteDBManager::getUnique();
+  auto table_registry = RegistryFactory::get().registry("table");
+
+  auto tablePlugin = std::make_shared<OptimizedInTestTablePlugin>();
+  table_registry->add("optin", tablePlugin);
+  attachTableInternal("optin", dbc, false);
+
+  QueryData results;
+  queryInternal(
+      "SELECT t.n, o.name FROM (SELECT 1 AS n UNION ALL SELECT 2) t "
+      "CROSS JOIN optin o WHERE o.name IN ('alpha', 'beta')",
+      results,
+      dbc);
+  EXPECT_EQ(2U, tablePlugin->scans);
+  EXPECT_EQ(4U, results.size());
+
+  results.clear();
+  tablePlugin->scans = 0;
+  queryInternal(
+      "SELECT id, name FROM optin WHERE id IN (1, 2) AND name IN ('alpha', "
+      "'beta')",
+      results,
+      dbc);
+  dbc->clearAffectedTables();
+
+  EXPECT_EQ(2U, tablePlugin->scans);
+  EXPECT_EQ(4U, results.size());
 }
 
 class exceptionalTablePlugin : public TablePlugin {
@@ -1216,18 +1359,17 @@ TEST_F(VirtualTableTests, test_table_exceptions) {
   auto exceptional = std::make_shared<exceptionalTablePlugin>();
   tables->add("exceptional", exceptional);
   auto dbc = SQLiteDBManager::getUnique();
-  attachTableInternal(
-      "exceptional", exceptional->columnDefinition(false), dbc, false);
+  attachTableInternal("exceptional", dbc, false);
 
-  auto backup_flag = FLAGS_table_exceptions;
-  FLAGS_table_exceptions = false;
+  auto backup_flag = FLAGS_ignore_table_exceptions;
+  FLAGS_ignore_table_exceptions = true;
   {
     QueryData results;
     auto status = queryInternal("SELECT * FROM exceptional", results, dbc);
     EXPECT_FALSE(status.ok());
   }
 
-  FLAGS_table_exceptions = true;
+  FLAGS_ignore_table_exceptions = false;
   {
     EXPECT_THROW(
         {
@@ -1236,7 +1378,47 @@ TEST_F(VirtualTableTests, test_table_exceptions) {
         },
         std::runtime_error);
   }
-  FLAGS_table_exceptions = backup_flag;
+  FLAGS_ignore_table_exceptions = backup_flag;
+}
+
+namespace tables {
+namespace sqlite {
+std::string getTableDocHint(const std::string& name);
+} // namespace sqlite
+} // namespace tables
+
+class docHintTablePlugin : public TablePlugin {
+ private:
+  TableColumns columns() const override {
+    return {
+        std::make_tuple("col1", TEXT_TYPE, ColumnOptions::DEFAULT),
+    };
+  }
+
+ public:
+  TableRows generate(QueryContext& context) override {
+    return TableRows();
+  }
+};
+
+TEST_F(VirtualTableTests, test_table_doc_hint) {
+  // A built-in table links to the osquery schema.
+  EXPECT_EQ(tables::sqlite::getTableDocHint("processes"),
+            "Please see the table documentation: "
+            "https://osquery.io/schema/#processes");
+
+  // A table provided by an extension is not in the osquery schema. Create the
+  // connection before registering the table, since getUnique() attaches every
+  // registered table as a non-extension table.
+  auto dbc = SQLiteDBManager::getUnique();
+  auto registry = RegistryFactory::get().registry("table");
+  registry->add("doc_hint_extension_table",
+                std::make_shared<docHintTablePlugin>());
+  attachTableInternal("doc_hint_extension_table", dbc, true);
+
+  auto hint = tables::sqlite::getTableDocHint("doc_hint_extension_table");
+  EXPECT_EQ(hint.find("osquery.io"), std::string::npos) << hint;
+  EXPECT_NE(hint.find("provided by an extension"), std::string::npos) << hint;
 }
 
 } // namespace osquery

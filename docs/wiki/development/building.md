@@ -4,11 +4,11 @@ osquery supports many flavors of Linux, macOS, and Windows.
 
 While osquery runs on a large number of operating systems, we only provide build instructions for a select few.
 
-The supported compilers are: the osquery toolchain (LLVM/Clang 9.0.1) on Linux, MSVC v142 on Windows, and AppleClang from Xcode Command Line Tools 11.7.
+The supported compilers are: the osquery toolchain (LLVM/Clang 9.0.1) on Linux, MSVC v142 on Windows, and AppleClang from Xcode Command Line Tools 16.x+.
 
 ## Prerequisites
 
-Git (>= 2.14.0), CMake (>= 3.17.5), Python 3 are required to build. The rest of the dependencies are downloaded by CMake.
+Git (>= 2.14.0), CMake (>= 3.25), Python 3 are required to build. The rest of the dependencies are downloaded by CMake.
 
 The default build type is `RelWithDebInfo` (optimizations active + debug symbols) and can be changed in the CMake configure phase by setting the `CMAKE_BUILD_TYPE` flag to `Release` or `Debug`.
 
@@ -16,71 +16,63 @@ The build type is chosen when building on Windows, through the `--config` option
 
 Note: the recommended system memory for building osquery is at least 8GB, or Clang may crash during the compilation of third-party dependencies.
 
-## Linux (Ubuntu 18)
+## Linux
 
-The initial directory is assumed to be `/home/<user>`.
+These steps support Ubuntu, Debian, Fedora, RHEL, and RHEL-compatible distributions such as AlmaLinux, Rocky Linux, and CentOS Stream. Only the distribution's default repositories are needed; EPEL is not required.
 
 ```bash
-# Install the prerequisites
-sudo apt install --no-install-recommends git python3 bison flex make
-
-# Optional: install python tests prerequisites
-sudo apt install --no-install-recommends python3-pip python3-setuptools python3-psutil python3-six python3-wheel
-pip3 install timeout_decorator thrift==0.11.0 osquery pexpect==3.3
-
-# Optional: install RPM packaging prerequisites
-sudo apt install --no-install-recommends rpm binutils
-
-# Download and install the osquery toolchain
-export ARCH=$(uname -m) # There is toolchain support for x86_64 and aarch64.
-wget https://github.com/osquery/osquery-toolchain/releases/download/1.1.0/osquery-toolchain-1.1.0-${ARCH}.tar.xz
-sudo tar xvf osquery-toolchain-1.1.0-${ARCH}.tar.xz -C /usr/local
-
-# Download and install a newer CMake.
-# Afterward, verify that `/usr/local/bin` is in the `PATH` and comes before `/usr/bin`.
-# Please see the note below for building CMake on aarch64.
-if [[ "${ARCH}" = "x86_64" ]]; then
-  wget https://cmake.org/files/v3.17/cmake-3.17.5-Linux-${ARCH}.tar.gz
-  sudo tar xvf cmake-3.17.5-Linux-${ARCH}.tar.gz -C /usr/local --strip 1
-fi
-
-# Download source
+# Download source (install git first if needed, with apt or dnf)
 git clone https://github.com/osquery/osquery
 cd osquery
 
+# Install the prerequisites and the osquery toolchain (uses sudo)
+tools/bootstrap-linux.sh
+
 # Build osquery
-mkdir build; cd build
-cmake -DOSQUERY_TOOLCHAIN_SYSROOT=/usr/local/osquery-toolchain ..
-cmake --build . -j10 # where 10 is the number of parallel build jobs
+make build
 ```
 
-**CMake on aarch64**
+`tools/bootstrap-linux.sh` (also available as `make prerequisites` once `make` is installed) installs the distribution packages (Git, Python 3, Bison, Flex, Make, CMake, Perl, and ccache if it is available), checks that the CMake version and the Perl modules needed by OpenSSL are present, and installs the [osquery toolchain](https://github.com/osquery/osquery-toolchain) to `/usr/local/osquery-toolchain` after verifying its checksum. Run `tools/bootstrap-linux.sh --help` for its options; for example, `--with-tests` also creates a Python virtualenv at `~/.venvs/osquery` (change it with `--venv-dir`) with the test prerequisites.
 
-If you are building for aarch64 then please notes CMake > 3.19.3 includes aarch64 Linux binaries,
-however it also has a bug that prevents creating RPMs properly.
-
-Prefer to build and install CMake from source:
+`make build` configures the `build` folder with the `linux` preset from `CMakePresets.json`, then builds it. Without `make`, the equivalent commands are:
 
 ```bash
-wget https://github.com/Kitware/CMake/releases/download/v3.17.5/cmake-3.17.5.tar.gz
-sudo apt install gcc g++ libssl-dev
-tar zxvf cmake-3.17.5.tar.gz
-pushd cmake-3.17.5/
-./bootstrap -- -DCMAKE_BUILD_TYPE:STRING=Release
-make -j`nproc`
-sudo make install
-popd
+cmake --preset linux
+cmake --build --preset linux -j $(nproc)
 ```
+
+Other useful targets are `make test` (configure with tests enabled, build, then run the tests that don't require root), `make configure`, and `make clean`. For the Python tests, run `tools/bootstrap-linux.sh --with-tests` first and activate the virtualenv with `source ~/.venvs/osquery/bin/activate`. The default location keeps it out of the source tree, so a source tree shared between a host and a VM doesn't end up with one machine's virtualenv overwriting the other's. Set `JOBS` to limit the number of parallel build jobs, for example `make build JOBS=4` on machines with less memory.
+
+Optional extras, which the script doesn't install:
+
+- Docker or Podman, for the Docker table tests. On Ubuntu, install `docker.io` and add your user to the `docker` group; on RHEL and Fedora, install `podman` and `podman-docker`.
+- `rpm` (Ubuntu) or `rpm-build` (RHEL, Fedora), and `binutils`, for building packages.
+
+### Manual Linux prerequisites
+
+On distributions the script doesn't support, install the equivalent of these packages, then install the toolchain for your architecture (`x86_64` or `aarch64`):
+
+```bash
+# Ubuntu/Debian package names; use your distribution's equivalents
+sudo apt install --no-install-recommends git python3 bison flex make cmake perl ccache
+
+export ARCH=$(uname -m)
+wget https://github.com/osquery/osquery-toolchain/releases/download/1.2.0/osquery-toolchain-1.2.0-${ARCH}.tar.xz
+sudo tar xvf osquery-toolchain-1.2.0-${ARCH}.tar.xz -C /usr/local
+```
+
+The OpenSSL build runs the first `perl` on your `PATH`, which needs the full set of core modules (including `FindBin` and `IPC::Cmd`). Python test prerequisites are listed in `tools/tests/requirements.txt`.
 
 ## macOS
 
-The current build of osquery supports deployment to the same set of macOS versions (macOS 10.12 and newer).  _Building_ osquery from source on macOS now requires 10.15 Catalina.
+The current build of osquery supports deployment to the same set of macOS versions (macOS 10.15 and newer). _Building_
+osquery from source on macOS requires Xcode 16 or newer.
 
 The initial directory is assumed to be `/Users/<user>`
 
 ### Step 1: Install macOS prerequisites
 
-Please ensure [Homebrew](https://brew.sh/) has been installed, and install a _full copy_ of Xcode 12 or newer (not just the Xcode command-line tools, although you need to install those too — launch Xcode after installing or upgrading, and complete its installation of the "additional components" when prompted).
+Please ensure [Homebrew](https://brew.sh/) has been installed, and install a _full copy_ of Xcode 16 or newer (not just the Xcode command-line tools, although you need to install those too — launch Xcode after installing or upgrading, and complete its installation of the "additional components" when prompted).
 
 Then do the following.
 
@@ -88,23 +80,24 @@ Then do the following.
 # Install prerequisites
 xcode-select --install
 brew install ccache git git-lfs cmake python clang-format flex bison
-
-# Optional: install python tests prerequisites
-pip3 install --user setuptools pexpect==3.3 psutil timeout_decorator six thrift==0.11.0 osquery
 ```
 
 ### Step 2: Download and build source on macOS
-
-In the following example, the use of the additional CMake argument `-DCMAKE_OSX_DEPLOYMENT_TARGET=10.12` specifies macOS 10.12 as the minimum compatible macOS version to which you can deploy osquery (this affects the version of the macOS SDK used at build time).
 
 ```bash
 # Download source
 git clone https://github.com/osquery/osquery
 cd osquery
 
+# Optional: install Python test prerequisites
+# Homebrew Python uses an externally managed environment, so install these in a virtualenv
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install setuptools pexpect==3.3 psutil timeout_decorator six thrift==0.11.0 osquery
+
 # Configure
 mkdir build; cd build
-cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=10.12 ..
+cmake ..
 
 # Build
 cmake --build . -j $(sysctl -n hw.ncpu)
@@ -114,13 +107,36 @@ cmake --build . -j $(sysctl -n hw.ncpu)
 
 Certain functionality on macOS requires an entitled and code-signed executable. By default, macOS builds from source will be _unsigned_ and these particular features will be disabled at runtime.
 
-Specifically, the `es_process_events` table makes use of the EndpointSecurity APIs, which require osquery to be code-signed with a certificate possessing the EndpointSecurity Client entitlement. If unsigned, osquery will still run as normal, but `es_process_events` will be disabled.
+Specifically, the `es_process_events` and `es_process_file_events` tables makes use of the EndpointSecurity APIs, which require osquery to be code-signed with a certificate possessing the EndpointSecurity Client entitlement. If unsigned, osquery will still run as normal, but `es_process_events` and `es_process_file_events` will be disabled.
 
-Organizations wishing to code-sign osquery themselves will need their Apple Developer team _account owner_ to manually request and obtain the EndpointSecurity Client entitlement from Apple, for their organization's code-signing certificate. Developers can also disable SIP in a development VM (disabling SIP decreases your system's security and is _not_ recommended except on a VM dedicated to building osquery) and use ad-hoc code-signing, if they want to work on `es_process_events` without pursuing the entitlement.
+Organizations wishing to code-sign osquery themselves will need their Apple Developer team _account owner_ to manually request and obtain the EndpointSecurity Client entitlement from Apple, for their organization's code-signing certificate.
+
+#### Testing EndpointSecurity Without Entitlements from Apple
+
+Developers can also disable SIP in a development VM (disabling SIP decreases your system's security and is _not_ recommended except on a VM dedicated to building osquery) and use ad-hoc code-signing to test `es_process_events` and `es_process_file_events` without pursuing the entitlement.
 
 If using VMware Fusion 12, for example, you can reach Recovery Mode by going to Virtual Machine, Settings, Startup Disk. There, hold the Option key, and click `Restart to Firmware...`. Restarting the VM will now enter the VMware virtual EFI shell. From here, select `Enter Setup`, `Boot from a File`, and then arrow down to the Recovery partition. Hit return to find and select the `boot.efi`, and hit return again to enter Recovery Mode. From a Terminal in Recovery Mode, you can [disable SIP](https://developer.apple.com/library/archive/documentation/Security/Conceptual/System_Integrity_Protection_Guide/ConfiguringSystemIntegrityProtection/ConfiguringSystemIntegrityProtection.html) and then reboot to macOS.
 
-## Windows 10
+To perform the ad-hoc signing, first create an entitlements file (`entitlements.plist`) with the following contents:
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.endpoint-security.client</key>
+    <true/>
+</dict>
+</plist>
+```
+
+Then sign the osquery binary (update binary and entitlement file paths as appropriate). This codesign command must be run on the VM where the testing is taking place:
+
+```
+codesign -s - -f --entitlements ./entitlements.plist ./osqueryd
+```
+
+## Windows 11
 
 The initial directory is assumed to be `C:\`
 
@@ -134,15 +150,16 @@ After changing that key, reboot your build machine and re-attempt the build.
 
 Note: It may be easier to install these prerequisites using [Chocolatey](https://chocolatey.org/).
 
-- [CMake](https://cmake.org/) (>= 3.17.5): the MSI installer is recommended. During installation, select the option to add it to the system `PATH` for all users. If there is any older version of CMake installed (e.g., using Chocolatey), uninstall that version first!  Do not install CMake using the Visual Studio Installer, because it contains an older version than required.
-- Visual Studio 2019 (2 options)
-  1. [Visual Studio 2019 Build Tools Installer](https://visualstudio.microsoft.com/thank-you-downloading-visual-studio/?sku=BuildTools&rel=16) (without Visual Studio): In the installer choose the "C++ build tools" workload, then on the right, under "Optional", select "MSVC v142 - VS 2019 C++", "Windows 10 SDK", and "C++ Clang tools for Windows".
-  2. [Visual Studio 2019 Community Installer](https://visualstudio.microsoft.com/thank-you-downloading-visual-studio/?sku=Community&rel=16): In the installer choose the "Desktop development with C++" workload, then on the right, under "Optional", select "MSVC v142 - VS 2019 C++", "Windows 10 SDK", and "C++ Clang tools for Windows".
+- [CMake](https://cmake.org/download/) (>= 4.0.3): The MSI installer is recommended. During installation, select the option to add it to the system `PATH` for all users. If there is any older version of CMake installed (eg. using Chocolatey), uninstall that version first! Do not install CMake using the Visual Studio Installer.
+- [Visual Studio 2022 Community](https://visualstudio.microsoft.com/thank-you-downloading-visual-studio/?sku=Community&rel=17): In the installer choose the "Desktop development with C++" workload, then on the right, under "Optional", select "MSVC v143 - VS 2022 C++" (both x64 and ARM64 variants), "Windows 11 SDK", "C++ ATL" (both x64 and ARM64 variants), and "C++ Clang tools for Windows".
 - [Git for Windows](https://github.com/git-for-windows/git/releases/latest): Select "checkout as-is, commit as-is". Later check "Enable symbolic links" support.
 - [Python 3](https://www.python.org/downloads/windows/), specifically the 64-bit version.
-- [Wix Toolset](https://wixtoolset.org/releases/)
 - [Strawberry Perl](https://strawberryperl.com/) for the OpenSSL formula. It is recommended to install it to the default destination path.
+
+Optional:
+
 - [7-Zip](https://www.7-zip.org/) if building the Chocolatey package.
+- [Wix Toolset](https://wixtoolset.org/releases/) if building the MSI package.
 
 ### Optional: Install Python tests prerequisites
 
@@ -153,23 +170,24 @@ Python 3 is assumed to be installed in `C:\Program Files\Python37`
 & 'C:\Program Files\Python37\python.exe' -m pip install setuptools psutil timeout_decorator thrift==0.11.0 osquery pywin32
 ```
 
-The use of an Administrator shell is recommended because the build process creates symbolic links. These [require a special permission to create on Windows](https://docs.microsoft.com/en-us/windows/security/threat-protection/security-policy-settings/create-symbolic-links), and the simplest solution is to build as Administrator. If you wish, you can instead assign just the `SeCreateSymbolicLinkPrivilege` permission to the user account. The setting can be found in "Local Security Policy" under Security Settings, Local Policies, User Rights Assignment. The user then has to log out and back in for the policy change to apply.
-
 ### Step 2: Download and build source on Windows
 
+After installing dependencies, start a fresh PowerShell window as Administrator:
+
 ```PowerShell
-# Using a PowerShell console as Administrator (see note, below)
 # Download source
 git clone https://github.com/osquery/osquery
 cd osquery
 
 # Configure
 mkdir build; cd build
-cmake -G "Visual Studio 16 2019" -A x64 ..
+cmake -G "Visual Studio 17 2022" -A x64 .. # or -A arm64
 
 # Build
 cmake --build . --config RelWithDebInfo -j10 # Number of projects to build in parallel
 ```
+
+The use of an Administrator shell is recommended because the build process creates symbolic links. These [require a special permission to create on Windows](https://docs.microsoft.com/en-us/windows/security/threat-protection/security-policy-settings/create-symbolic-links), and the simplest solution is to build as Administrator. If you wish, you can instead assign just the `SeCreateSymbolicLinkPrivilege` permission to the user account. The setting can be found in "Local Security Policy" under Security Settings, Local Policies, User Rights Assignment. The user then has to log out and back in for the policy change to apply.
 
 ## Testing
 
@@ -196,7 +214,16 @@ To run a single test, in verbose mode:
 ctest -R <test name> -C <RelWithDebInfo|Release|Debug> -V
 ```
 
+A "single" test case often still involves dozens or hundreds of unit tests. To run a single _unit test_, you can pass the [`GTEST_FILTER`](https://github.com/google/googletest/blob/master/googletest/docs/advanced.md#running-a-subset-of-the-tests) variable, for example:
+
+```PowerShell
+$Env:GTEST_FILTER='windowsEventLog.*'
+ctest -R tests_integration_tables-test -C RelWithDebInfo -V #runs just the windowsEventLog under the integration tables tests
+```
+
 ### Run tests on Linux and macOS
+
+On Linux, the `tools_tests_testfschangestable` test needs the Python `docker` package and a running Docker daemon that your user can access (see the optional test prerequisites in the [Linux](#linux-ubuntu-24) section). The test starts an `ubuntu:18.04` container, so it also needs to be able to pull that image from Docker Hub. If the test cannot connect to `/var/run/docker.sock`, a `FileNotFoundError` means Docker is not installed or not running, and a `PermissionError` means your user is not yet in the `docker` group.
 
 To run the tests and get just a summary report:
 
@@ -255,9 +282,9 @@ To avoid having to move the committed files to the stage area and back each time
 The `cppcheck` tool runs some static analysis checks on the C++ code to detect possible bugs or undefined behaviors.
 
 1. Install the cppcheck prerequisite:
-    - On Linux: `apt install cppcheck`
-    - On macOS: `brew install cppcheck`
-    - On Windows: download and run [the cppcheck MSI installer](https://github.com/danmar/cppcheck/releases).
+   - On Linux: `apt install cppcheck`
+   - On macOS: `brew install cppcheck`
+   - On Windows: download and run [the cppcheck MSI installer](https://github.com/danmar/cppcheck/releases).
 2. Build the `cppcheck` target: `cmake --build . --target cppcheck`
 
 ## Running clang-tidy (Linux only)
@@ -270,13 +297,13 @@ The `clang-tidy` executable is shipped along with the osquery toolchain, and it 
 
 By default, the following checks are enabled:
 
-1. cert-*
-2. cppcoreguidelines-*
-3. performance-*
-4. portability-*
-5. readability-*
-6. modernize-*
-7. bugprone-*
+1. cert-\*
+2. cppcoreguidelines-\*
+3. performance-\*
+4. portability-\*
+5. readability-\*
+6. modernize-\*
+7. bugprone-\*
 
 ## Using Vagrant
 
@@ -321,37 +348,63 @@ vagrant up aws-amazon2015.03 --provider=aws
 vagrant ssh aws-amazon2015.03
 ```
 
-## Custom Packages
+## Building packages
 
-Package creation is facilitated by CPack. Creating a standalone custom package on any platform should be as simple as running:
+The packaging logic is now in a separate repository, [osquery-packaging](https://github.com/osquery/osquery-packaging). Packages are created in two steps:
+
+1. Create the package data from osquery/osquery
+2. Use the osquery/osquery-packaging logic to create the actual packages
+
+This approach allows maintainers to easily re-generate all the officially supported packages without going through the whole build process, which is especially useful when applying code signing from a protected machine.
+
+### Generating the package data
+
+1. Build osquery
+2. Create a destination folder and set its path in the `DESTDIR` environment variable
+3. Run the `install` target
 
 ```sh
-cmake --build . --target package
+cd build_folder
+mkdir package_data
+export DESTDIR=$(pwd)/package_data  # on Windows: `set DESTDIR=path` or `$Env:DESTDIR=path` for PowerShell
+cmake --build . --target install    # on Windows: add --config Release
 ```
 
-Invoking the `package` target will instruct `cpack` to auto resolve all of the package
-dependencies for osquery and build a platform specific package. The package created will include several components:
+The newly created folder will include several components:
 
-- The executables: `osqueryd`, `osqueryi`, and small management script `osqueryctl`
-- An osquery systemd unit on Linux (with initd script wrapper)
-- An osquery LaunchDaemon on macOS
+- The executables: `osqueryd`, `osqueryi`
 - The lenses provided by our Augeas third-party dependency
 - A default, or fall-back, OpenSSL certificate store (found within the repository)
 - The example query packs from the repository
 - Folder structures required for logging
+- Windows: small management scripts: `osqueryctl` and `manage-osqueryd.ps1`
+- Linux: systemd units, with initd script wrappers
+- macOS: a LaunchDaemon unit
+- Package control files (i.e.: deb-specific configurations, XML data required by WIX to generate MSI, etc..)
 
-What follows are instructions for directly invoking `cpack` on each platform, should
-you wish to create a more custom deployment package. For the most part this is not
-encouraged, and users should stick with leveraging the `package` target as detailed above.
+### Identifying the osquery version
 
-### On Linux
+**Linux, macOS**
 
-To create a DEB, RPM, or TGZ on Linux, CPack will attempt to auto-detect the appropriate package type.
-You may override this with the CMake `PACKAGING_SYSTEM` variable as seen in the example below.
+```sh
+cd osquery_source_folder
+git fetch --tags
 
-Note: RPM will always try to create debuginfo packages, to do so though it needs the source folder
-to be in a path that's longer than `/usr/src/debug/osquery/src_0` and the build folder
-to be in a path that's longer than `/usr/src/debug/osquery/src_1`.
+export OSQUERY_VERSION=$(git describe --tags --always)
+```
+
+**Windows**
+
+```batch
+cd osquery_source_folder
+
+git fetch --tags
+git describe --tags --abbrev=0
+
+set OSQUERY_VERSION=<version_here>
+```
+
+### Preparing to build the osquery-packaging repository
 
 Pre-requisites (for RPM builds):
 
@@ -362,46 +415,82 @@ sudo apt install binutils elfutils
 Generating an RPM package:
 
 ```sh
-cmake -DOSQUERY_TOOLCHAIN_SYSROOT=/usr/local/osquery-toolchain -DPACKAGING_SYSTEM=RPM ..
+git clone https://github.com/osquery/osquery-packaging
+
+mkdir build
+cd build
+```
+
+Common input parameters
+
+- **OSQUERY_VERSION**: can be customized, but we usually use the output of `git describe --always`
+- **OSQUERY_DATA_PATH**: Where the package data has been installed
+
+### Creating the Linux packages
+
+When generating packages, the install path for osquery is determined by `CMAKE_INSTALL_PREFIX` (default:
+`/usr/local/`) when building the TGZ "package", and `CMAKE_PACKAGING_INSTALL_PREFIX` (default: `/usr/`)
+when building either the DEB or RPM packages.
+
+Linux-specific parameters:
+
+- **CPACK_GENERATOR**: Either `DEB`, `RPM` or `TGZ`
+- **OSQUERY_SOURCE_DIRECTORY_LIST**: An optional list of paths, populated when creating the debuginfo and dbgsym packages for DEB/RPM. Pass the source and the build folders of osquery if you want to generate them.
+
+_Note: RPM will always try to create debuginfo packages, to do so though it needs the source folder to be in a path that's longer than `/usr/src/debug/osquery/src_0` and the build folder to be in a path that's longer than `/usr/src/debug/osquery/src_1`._
+
+```sh
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCPACK_GENERATOR=DEB \
+  -DOSQUERY_PACKAGE_VERSION=${OSQUERY_VERSION} \
+  -DOSQUERY_DATA_PATH=${DESTDIR} \
+  -DOSQUERY_SOURCE_DIRECTORY_LIST="osquery-src-path;osquery-build-path" \
+  ../osquery-packaging
+
 cmake --build . --target package
 ```
 
-When generating packages, the install path for osquery is determined by `CMAKE_INSTALL_PREFIX` (default:
- `/usr/local/`) when building the TGZ "package", and `CMAKE_PACKAGING_INSTALL_PREFIX` (default: `/usr/`)
-  when building either the DEB or RPM packages.
+### Creating the Windows packages
 
-### On Windows
+Windows-specific parameters:
 
-On Windows CPack will create an MSI by default. You can toggle this behavior to instead create a
-Chocolatey package by overriding the CMake `PACKAGING_SYSTEM` variable similar to Linux.
+- **CPACK_GENERATOR**: Either `WIX` or `NuGet`
+- **OSQUERY_BITNESS**: Either 32 or 64, depending on which architecture has been built
 
-To create a default MSI package use the following:
+_Note: Please note that the NuGet and WIX generators only support the `a.b.c` version format. If the commit being built is not tagged, consider using `git describe --tags --abbrev=0`_
 
-```sh
-cmake -G "Visual Studio 16 2019" -A x64 ..
+```batch
+call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+
+cmake -DCMAKE_BUILD_TYPE=Release ^
+  -DCPACK_GENERATOR=WIX ^
+  -DOSQUERY_PACKAGE_VERSION=%OSQUERY_VERSION% ^
+  -DOSQUERY_DATA_PATH=%DESTDIR% ^
+  -DOSQUERY_BITNESS=64 ^
+  ..\osquery-packaging
+
 cmake --build . --config Release --target package
 ```
 
-To instead generate a Chocolatey package, use the following:
+### Creating the macOS packages
+
+macOS-specific parameters:
+
+- **CPACK_GENERATOR**: Either `productbuild` (PKG files) or `TGZ`
 
 ```sh
-cmake -DPACKAGING_SYSTEM=NuGet -G "Visual Studio 16 2019" -A x64 ..
-cmake --build . --config Release --target package
-```
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCPACK_GENERATOR=productbuild \
+  -DOSQUERY_PACKAGE_VERSION=${OSQUERY_VERSION} \
+  -DOSQUERY_DATA_PATH=${DESTDIR} \
+  ../osquery-packaging
 
-### On macOS
-
-On macOS you can choose between a TGZ or the default PKG.
-You may override this with the CMake `PACKAGING_SYSTEM` variable as seen in the example below.
-
-```sh
-cmake -DPACKAGING_SYSTEM=TGZ -DCMAKE_OSX_DEPLOYMENT_TARGET=10.12 ..
 cmake --build . --target package
 ```
 
 ## Build Performance
 
-Generating a virtual table should *not* impact system performance. This is easier said than done, as some tables may _seem_ inherently latent (if you expect to run queries like `SELECT * from suid_bin;` which performs a complete filesystem traversal looking for binaries with suid permissions). Please read the osquery features and guide on [performance safety](../deployment/performance-safety.md).
+Generating a virtual table should _not_ impact system performance. This is easier said than done, as some tables may _seem_ inherently latent (if you expect to run queries like `SELECT * from suid_bin;` which performs a complete filesystem traversal looking for binaries with suid permissions). Please read the osquery features and guide on [performance safety](../deployment/performance-safety.md).
 
 Some quick features include:
 

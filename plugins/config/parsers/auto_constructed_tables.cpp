@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
+#include <boost/algorithm/string.hpp>
+
 #include <osquery/config/config.h>
 #include <osquery/core/system.h>
 #include <osquery/core/tables.h>
@@ -22,6 +24,14 @@
 namespace rj = rapidjson;
 
 namespace osquery {
+
+TableAttributes ATCPlugin::attributes() const {
+  return table_attributes_;
+}
+
+void ATCPlugin::setActive() {
+  table_attributes_ = TableAttributes::NONE;
+}
 
 TableRows ATCPlugin::generate(QueryContext& context) {
   TableRows result;
@@ -46,7 +56,7 @@ TableRows ATCPlugin::generate(QueryContext& context) {
     if (!s.ok()) {
       LOG(WARNING) << "ATC Table: Error Code: " << s.getCode()
                    << " Could not generate data: " << s.getMessage()
-                   << " for path " << path_;
+                   << " for path " << path;
     }
   }
   return result;
@@ -118,7 +128,7 @@ Status ATCConfigParserPlugin::update(const std::string& source,
     auto doc = JSON::newObject();
     auto obj = doc.getObject();
     doc.copyFrom(cv->second.doc(), obj);
-    doc.add(kParserKey, obj);
+    doc.addCopy(kParserKey, obj);
     data_ = std::move(doc);
   }
 
@@ -162,15 +172,13 @@ Status ATCConfigParserPlugin::update(const std::string& source,
     std::string columns_value;
     columns_value.reserve(256);
 
-    // Always add the implicit path column
-    columns.push_back(
-        make_tuple(std::string("path"), TEXT_TYPE, ColumnOptions::DEFAULT));
-    columns_value += "path,";
-
     if (!params.HasMember("columns") || !params["columns"].IsArray()) {
-      LOG(WARNING) << "ATC Table: " << table_name
-                   << " is misconfigured (no columns)";
+      LOG(WARNING) << "ATC Table: Skipping " << table_name
+                   << " because it is misconfigured (no columns)";
+      continue;
     }
+
+    std::string user_defined_path_column;
 
     for (const auto& column : params["columns"].GetArray()) {
       if (!column.IsString()) {
@@ -179,16 +187,25 @@ Status ATCConfigParserPlugin::update(const std::string& source,
         continue;
       }
 
-      if (std::string(column.GetString()) == std::string("path")) {
-        LOG(WARNING) << "ATC Table: " << table_name
-                     << " is misconfigured. The configuration include `path`,"
-                     << " which is a reserved column";
-        continue;
+      if (boost::iequals(column.GetString(), "path")) {
+        user_defined_path_column = column.GetString();
       }
 
       columns.push_back(make_tuple(
           std::string(column.GetString()), TEXT_TYPE, ColumnOptions::DEFAULT));
       columns_value += std::string(column.GetString()) + ",";
+    }
+
+    if (!user_defined_path_column.empty()) {
+      LOG(WARNING) << "ATC Table: " << table_name
+                   << " is misconfigured. The configuration includes `"
+                   << user_defined_path_column
+                   << "`. This is a reserved column name";
+    } else {
+      // Add implicit path column
+      columns.push_back(
+          make_tuple(std::string("path"), TEXT_TYPE, ColumnOptions::DEFAULT));
+      columns_value += "path,";
     }
 
     registered.erase(table_name);
@@ -218,8 +235,8 @@ Status ATCConfigParserPlugin::update(const std::string& source,
       continue;
     }
 
-    s = tables->add(
-        table_name, std::make_shared<ATCPlugin>(path, columns, query), true);
+    auto plugin = std::make_shared<ATCPlugin>(path, columns, query);
+    s = tables->add(table_name, plugin, true);
     if (!s.ok()) {
       LOG(WARNING) << "ATC Table: " << table_name << ": " << s.getMessage();
       deleteDatabaseValue(kPersistentSettings, kDatabaseKeyPrefix + table_name);
@@ -227,8 +244,14 @@ Status ATCConfigParserPlugin::update(const std::string& source,
     }
 
     PluginResponse resp;
-    Registry::call(
+    s = Registry::call(
         "sql", "sql", {{"action", "attach"}, {"table", table_name}}, resp);
+    if (!s.ok()) {
+      LOG(WARNING) << "ATC Table: " << table_name << ": " << s.getMessage();
+      deleteDatabaseValue(kPersistentSettings, kDatabaseKeyPrefix + table_name);
+    }
+    plugin->setActive();
+
     LOG(INFO) << "ATC table: " << table_name << " Registered";
   }
 

@@ -101,6 +101,30 @@ const std::unordered_map<USNJournalEventRecord::Type, std::string>
         {USNJournalEventRecord::Type::FileSecurityAttributesChange, "FileSecurityAttributesChange"}};
 // clang-format on
 
+bool USNJournalEventRecord::isWriteOperation(USNJournalEventRecord::Type type) {
+  switch (type) {
+  case USNJournalEventRecord::Type::FileWrite:
+  case USNJournalEventRecord::Type::DirectoryCreation:
+  case USNJournalEventRecord::Type::DirectoryOverwrite:
+  case USNJournalEventRecord::Type::FileOverwrite:
+  case USNJournalEventRecord::Type::DirectoryTruncation:
+  case USNJournalEventRecord::Type::FileTruncation:
+  case USNJournalEventRecord::Type::TransactedDirectoryChange:
+  case USNJournalEventRecord::Type::TransactedFileChange:
+  case USNJournalEventRecord::Type::FileCreation:
+  case USNJournalEventRecord::Type::DirectoryDeletion:
+  case USNJournalEventRecord::Type::FileDeletion:
+  case USNJournalEventRecord::Type::DirectoryLinkChange:
+  case USNJournalEventRecord::Type::FileLinkChange:
+  case USNJournalEventRecord::Type::DirectoryRename_NewName:
+  case USNJournalEventRecord::Type::FileRename_NewName:
+    return true;
+
+  default:
+    return false;
+  }
+}
+
 namespace {
 /// Read buffer size
 const size_t kUSNJournalReaderBufferSize = 4096U;
@@ -278,7 +302,7 @@ Status USNJournalReader::initialize() {
     if (!getWindowsErrorDescription(description, error_code)) {
       description = L"Unknown error";
     }
-    error_message << wstringToString(description.c_str());
+    error_message << wstringToString(description);
 
     return Status::failure(error_message.str());
   }
@@ -331,7 +355,7 @@ Status USNJournalReader::acquireRecords() {
     if (!getWindowsErrorDescription(description, ::GetLastError())) {
       description = L"Unknown error";
     }
-    error_message << wstringToString(description.c_str());
+    error_message << wstringToString(description);
 
     return Status::failure(error_message.str());
   }
@@ -803,7 +827,7 @@ bool GetEventString(std::string& buffer, const USN_RECORD* record) {
   }
 
   std::wstring wide_chars_file_name(filename, (name_length / sizeof(wchar_t)));
-  buffer = wstringToString(wide_chars_file_name.c_str());
+  buffer = wstringToString(wide_chars_file_name);
 
   return true;
 }

@@ -80,6 +80,8 @@ const std::unordered_set<std::string> kAllowedSQLitePragmas = {
     "table_xinfo",
     "function_list",
     "journal_mode",
+    "case_sensitive_like",
+    "collation_list",
 };
 
 class SQLiteDBManager;
@@ -179,8 +181,10 @@ class SQLiteDBInstance : private boost::noncopyable {
   /// See attach_mutex_ but used for the primary database.
   static RecursiveMutex kPrimaryAttachMutex;
 
-  /// Vector of tables that need their constraints cleared after execution.
-  std::map<std::string, std::shared_ptr<VirtualTableContent>> affected_tables_;
+  /// Tables that need their constraints cleared after execution, keyed by
+  /// content since a table and its aliases share a name.
+  std::map<const VirtualTableContent*, std::shared_ptr<VirtualTableContent>>
+      affected_tables_;
 
  private:
   friend class SQLiteDBManager;
@@ -188,6 +192,7 @@ class SQLiteDBInstance : private boost::noncopyable {
 
  private:
   FRIEND_TEST(SQLiteUtilTests, test_affected_tables);
+  FRIEND_TEST(VirtualTableTests, test_table_alias_affected_tables);
 };
 
 using SQLiteDBInstanceRef = std::shared_ptr<SQLiteDBInstance>;
@@ -456,6 +461,9 @@ class SQLInternal : private only_movable {
   /// ASCII escape the results of the query.
   void escapeResults();
 
+  /// Returns the size
+  uint64_t getSize();
+
  private:
   /// The internal member which holds the typed results of the query.
   QueryDataTyped resultsTyped_;
@@ -478,6 +486,11 @@ std::string getStringForSQLiteReturnCode(int code);
  * should be a non-const reference to a std::vector<Row>.
  */
 int queryDataCallback(void* argument, int argc, char* argv[], char* column[]);
+
+/**
+ * @brief Register versioning collations and function.
+ */
+void registerVersionExtensions(sqlite3* db);
 
 /**
  * @brief Register math-related 'custom' functions.
@@ -508,6 +521,11 @@ void registerEncodingExtensions(sqlite3* db);
  * @brief Register filesystem-related 'custom' functions.
  */
 void registerFilesystemExtensions(sqlite3* db);
+
+/**
+ * @brief Register network-related 'custom' functions.
+ */
+void registerNetworkExtensions(sqlite3* db);
 
 /**
  * @brief Generate the data for auto-constructed sqlite tables

@@ -65,9 +65,24 @@ doxygen/latex
 tags
 cscope.files
 cscope.out
+compile_commands.json
+
+# CMake generated compile commands
+compile_commands.json
+
+# Pyright type checker config
+pyrightconfig.json
 
 # Ignored components
 /external/*
 !/external/examples
 !/external/cmake/cmakelibs.cmake
 !/external/CMakeLists.txt
+
+# Python test virtualenv created by the macOS build steps
+/.venv/
+
+# Local CMake presets, and leftovers from a rejected in-source configure
+/CMakeUserPresets.json
+/CMakeCache.txt
+/CMakeFiles/

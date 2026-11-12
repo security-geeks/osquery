@@ -171,15 +171,21 @@ TEST_F(EventSubscriberPluginTests, removeOverflowingEventBatches) {
 
 TEST_F(EventSubscriberPluginTests, expireEventBatches) {
   MockedOsqueryDatabase mocked_database;
-  mocked_database.generateEvents("type", "name");
-  EXPECT_EQ(mocked_database.key_map.size(), 20U);
-
   EventSubscriberPlugin::Context context;
   EventSubscriberPlugin::setDatabaseNamespace(context, "type", "name");
 
   auto status =
       EventSubscriberPlugin::generateEventDataIndex(context, mocked_database);
+  ASSERT_TRUE(status.ok());
+  EXPECT_EQ(context.event_index.size(), 0U);
+  EventIndex index;
+  EXPECT_EQ(context.event_index, index);
 
+  mocked_database.generateEvents("type", "name");
+  EXPECT_EQ(mocked_database.key_map.size(), 20U);
+
+  status =
+      EventSubscriberPlugin::generateEventDataIndex(context, mocked_database);
   ASSERT_TRUE(status.ok());
   EXPECT_EQ(context.event_index.size(), 10U);
 
@@ -191,6 +197,11 @@ TEST_F(EventSubscriberPluginTests, expireEventBatches) {
 
   EventSubscriberPlugin::expireEventBatches(context, mocked_database, 1, 5);
   EXPECT_EQ(context.event_index.size(), 5U);
+
+  // One event should be left (see
+  // https://github.com/osquery/osquery/issues/8524)
+  EventSubscriberPlugin::expireEventBatches(context, mocked_database, 1, 15);
+  EXPECT_EQ(context.event_index.size(), 1U);
 }
 
 TEST_F(EventSubscriberPluginTests, generateRows) {
@@ -210,31 +221,33 @@ TEST_F(EventSubscriberPluginTests, generateRows) {
   std::size_t callback_count{0U};
   auto callback = [&callback_count](Row) { ++callback_count; };
 
-  EventIndex::iterator last;
-  last = EventSubscriberPlugin::generateRows(
+  auto result = EventSubscriberPlugin::generateRows(
       context, mocked_database, callback, 2, 1);
   EXPECT_EQ(callback_count, 0U);
-  EXPECT_EQ(last, context.event_index.end());
+  EXPECT_EQ(result.isEnd, true);
 
-  last = EventSubscriberPlugin::generateRows(
+  result = EventSubscriberPlugin::generateRows(
       context, mocked_database, callback, 0, 0);
   EXPECT_EQ(callback_count, 10U);
-  EXPECT_EQ(last->first, 9U);
+  EXPECT_EQ(result.isEnd, false);
+  EXPECT_EQ(result.last_time, 9U);
 
-  last = EventSubscriberPlugin::generateRows(
+  result = EventSubscriberPlugin::generateRows(
       context, mocked_database, callback, 0, 4);
   EXPECT_EQ(callback_count, 15U);
-  EXPECT_EQ(last->first, 4U);
+  EXPECT_EQ(result.isEnd, false);
+  EXPECT_EQ(result.last_time, 4U);
 
-  last = EventSubscriberPlugin::generateRows(
+  result = EventSubscriberPlugin::generateRows(
       context, mocked_database, callback, 5, 9);
   EXPECT_EQ(callback_count, 20U);
-  EXPECT_EQ(last->first, 9U);
+  EXPECT_EQ(result.isEnd, false);
+  EXPECT_EQ(result.last_time, 9U);
 
-  last = EventSubscriberPlugin::generateRows(
+  result = EventSubscriberPlugin::generateRows(
       context, mocked_database, callback, 10, 15);
   EXPECT_EQ(callback_count, 20U);
-  EXPECT_EQ(last, context.event_index.end());
+  EXPECT_EQ(result.isEnd, true);
 }
 
 class FakeEventSubscriberPlugin : public EventSubscriberPlugin {
@@ -347,9 +360,13 @@ TEST_F(EventSubscriberPluginTests, generateRowsWithExpiry) {
   subscriber.setTime(20);
   subscriber.generateRows(callback, true, 0, 0);
   EXPECT_EQ(10U, callback_count);
-  // Events are expired after being queried.
+
+  // Events are expired after being queried (except for last valid event --
+  // optimize should take care of that event not being returned again, but that
+  // is tested separately below.)
+  callback_count = 0;
   subscriber.generateRows(callback, true, 0, 0);
-  EXPECT_EQ(10U, callback_count);
+  EXPECT_EQ(1U, callback_count);
 }
 
 TEST_F(EventSubscriberPluginTests, generateRowsWithOptimize) {

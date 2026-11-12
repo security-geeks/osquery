@@ -93,6 +93,7 @@ typedef struct win_stat {
   std::string volume_serial;
   std::string product_version;
   std::string file_version;
+  std::string original_filename;
 
 } WINDOWS_STAT;
 
@@ -108,8 +109,6 @@ typedef struct {
 
 /// Constant for an invalid handle.
 const PlatformHandle kInvalidHandle = (PlatformHandle)-1;
-
-std::string lastErrorMessage(unsigned long);
 
 /**
  * @brief File access modes for PlatformFile.
@@ -243,6 +242,10 @@ class PlatformFile : private boost::noncopyable {
     return handle_;
   }
 
+  const boost::filesystem::path& getFilePath() const {
+    return fname_;
+  }
+
   /**
    * @brief Returns success if owner of the file is root.
    *
@@ -270,7 +273,7 @@ class PlatformFile : private boost::noncopyable {
   /// Return the modified, created, birth, updated, etc times.
   bool getFileTimes(PlatformTime& times);
 
-  /// Change the file times.
+  /// Set the access and modification times (atime, mtime) of the file.
   bool setFileTimes(const PlatformTime& times);
 
   /// Read a number of bytes into a buffer.
@@ -348,6 +351,19 @@ bool platformChmod(const std::string& path, mode_t perms);
  * only.
  */
 bool platformSetSafeDbPerms(const std::string& path);
+
+/**
+ * @brief Creates a directory with only owner-accessible permissions.
+ *
+ * Unlike creating a directory and then restricting it with platformChmod,
+ * this function ensures the directory is created without any group/other access
+ * (i.e., mode 0700 on POSIX, subject to umask), eliminating the race window
+ * where the directory is briefly world-readable or world-writable.
+ *
+ * @param path The path of the directory to create.
+ * @return Status indicating success or failure.
+ */
+Status platformCreatePrivateDir(const boost::filesystem::path& path);
 
 /**
  * @brief Multi-platform implementation of glob.
@@ -428,6 +444,19 @@ boost::filesystem::path getSystemRoot();
  * @return osquery::Status
  */
 Status platformLstat(const std::string& path, struct stat& d_stat);
+
+/**
+ * @brief Verifies if the provided file descriptor points to a file
+ *
+ */
+boost::optional<bool> platformIsFile(int fd);
+
+/**
+ * @brief Calls the platform specific version of fileno
+ *
+ * @return osquery::Status containing the errno
+ */
+Status platformFileno(FILE* file, int& fd);
 
 /**
  * @brief Populates the provided string with a textual representation of the

@@ -1,21 +1,40 @@
 project(thirdparty_openssl)
 
-set(OPENSSL_VERSION "1.1.1k")
-set(OPENSSL_ARCHIVE_SHA256 "892a0875b9872acd04a9fde79b1f943075d5ea162415de3047c327df33fbaee5")
+set(OPENSSL_VERSION "3.6.5")
+set(OPENSSL_ARCHIVE_SHA256 "a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98")
+
+set(OSQUERY_OPENSSL_ARCHIVE_PATH "" CACHE FILEPATH "Optional path to an openssl archive to use instead of downloading it")
+
+option(OSQUERY_OPENSSL_BUILD_TESTS "Build the OpenSSL test suite and add an openssl-test target to run it. The osquery build never runs it" OFF)
 
 include(ExternalProject)
 
 function(opensslMain)
 
   set(common_options
-    no-ssl2
     no-ssl3
+    no-ssl3-method
+    no-tls1
+    no-tls1-method
+    no-tls1_1
+    no-tls1_1-method
     no-asm
     no-shared
     no-weak-ssl-ciphers
     no-comp
+    no-docs
     enable-cms
   )
+
+  # The OpenSSL tests are not run by the osquery build, so they are not built
+  # by default. OpenSSL disables its tests along with its apps (the openssl
+  # program they drive), so both are needed to run them.
+  if(NOT OSQUERY_OPENSSL_BUILD_TESTS)
+    list(APPEND common_options
+      no-tests
+      no-apps
+    )
+  endif()
 
   add_library(thirdparty_openssl_ssl STATIC IMPORTED GLOBAL)
   add_library(thirdparty_openssl_crypto STATIC IMPORTED GLOBAL)
@@ -52,21 +71,33 @@ function(opensslMain)
       ${make_command} install_sw install_ssldirs
     )
 
+    set(test_command
+      ${make_command} test
+    )
+
+    if(TARGET_PROCESSOR STREQUAL "aarch64")
+      set(lib_folder_name "lib")
+    else()
+      set(lib_folder_name "lib64")
+    endif()
+
     set(openssl_libs
-      "${install_prefix}/lib/libssl.a"
-      "${install_prefix}/lib/libcrypto.a"
+      "${install_prefix}/${lib_folder_name}/libssl.a"
+      "${install_prefix}/${lib_folder_name}/libcrypto.a"
     )
 
     set_target_properties(thirdparty_openssl_ssl PROPERTIES IMPORTED_LOCATION
-      "${install_prefix}/lib/libssl.a"
+      "${install_prefix}/${lib_folder_name}/libssl.a"
     )
     set_target_properties(thirdparty_openssl_crypto PROPERTIES IMPORTED_LOCATION
-      "${install_prefix}/lib/libcrypto.a"
+      "${install_prefix}/${lib_folder_name}/libcrypto.a"
     )
 
   elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
     set(platform_c_flags
       -fPIC
+      -isysroot
+      ${CMAKE_OSX_SYSROOT}
     )
 
     if(NOT "${CMAKE_OSX_DEPLOYMENT_TARGET}" STREQUAL "")
@@ -75,9 +106,21 @@ function(opensslMain)
       )
     endif()
 
+    if(TARGET_PROCESSOR STREQUAL "aarch64")
+      set(target_name
+        "darwin64-arm64-cc"
+      )
+    elseif(TARGET_PROCESSOR STREQUAL "x86_64")
+      set(target_name
+        "darwin64-x86_64-cc"
+      )
+    else()
+      message(FATAL_ERROR "Unsupported target processor")
+    endif()
+
     set(configure_command
       "${CMAKE_COMMAND}" -E env "CC=${CMAKE_C_COMPILER}" "AR=${CMAKE_AR}"
-      perl ./Configure darwin64-x86_64-cc
+      perl ./Configure "${target_name}"
         ${common_options}
         ${OSQUERY_FORMULA_CFLAGS}
 
@@ -102,6 +145,10 @@ function(opensslMain)
       ${make_command} install_sw install_ssldirs
     )
 
+    set(test_command
+      ${make_command} test
+    )
+
     set(openssl_libs
       "${install_prefix}/lib/libssl.a"
       "${install_prefix}/lib/libcrypto.a"
@@ -118,9 +165,15 @@ function(opensslMain)
     set(CMAKE_PREFIX_PATH "C:\\Strawberry\\perl\\bin")
     find_package(Perl REQUIRED)
 
+    if("${TARGET_PROCESSOR}" STREQUAL "aarch64")
+      set(OPENSSL_ARCH VC-WIN64-ARM)
+    else()
+      set(OPENSSL_ARCH VC-WIN64A)
+    endif()
+
     set(configure_command
       "${CMAKE_COMMAND}" -E env
-      "${PERL_EXECUTABLE}" Configure VC-WIN64A
+      "${PERL_EXECUTABLE}" Configure ${OPENSSL_ARCH}
       ${common_options}
     )
 
@@ -130,6 +183,10 @@ function(opensslMain)
 
     set(build_command
       "${CMAKE_COMMAND}" -E env "cmd.exe" "/C" "nmake PERL=${perl_executable_path}"
+    )
+
+    set(test_command
+      "${CMAKE_COMMAND}" -E env "cmd.exe" "/C" "nmake PERL=${perl_executable_path} test"
     )
 
     set(install_command
@@ -162,12 +219,17 @@ function(opensslMain)
   list(APPEND openssl_c_flags ${OSQUERY_FORMULA_CFLAGS})
   string(REPLACE ";" " " openssl_c_flags "${openssl_c_flags}")
 
-  string(REGEX MATCH "[0-9]\.[0-9]\.[0-9]" OPENSSL_VERSION_NO_PATCH "${OPENSSL_VERSION}")
+  if("${OSQUERY_OPENSSL_ARCHIVE_PATH}" STREQUAL "")
+    set(openssl_urls
+      "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+    )
+  else()
+    if(NOT EXISTS "${OSQUERY_OPENSSL_ARCHIVE_PATH}" OR IS_DIRECTORY "${OSQUERY_OPENSSL_ARCHIVE_PATH}")
+      message(FATAL_ERROR "The path provided to the openssl archive is incorrect: ${OSQUERY_OPENSSL_ARCHIVE_PATH}")
+    endif()
 
-  set(openssl_urls
-    "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
-    "https://www.openssl.org/source/old/${OPENSSL_VERSION_NO_PATCH}/openssl-${OPENSSL_VERSION}.tar.gz"
-  )
+    set(openssl_urls "${OSQUERY_OPENSSL_ARCHIVE_PATH}")
+  endif()
 
   ExternalProject_Add(openssl
     URL "${openssl_urls}"
@@ -188,6 +250,20 @@ function(opensslMain)
     WORKING_DIRECTORY "${SOURCE_DIR}"
   )
 
+  # Running the tests is a manual step, e.g. when updating OpenSSL: build the
+  # openssl-test target. Some tests may be expected to fail with our options.
+  if(OSQUERY_OPENSSL_BUILD_TESTS)
+    ExternalProject_Add_Step(openssl test
+      COMMAND ${test_command}
+      DEPENDEES build
+      WORKING_DIRECTORY "${SOURCE_DIR}"
+      EXCLUDE_FROM_MAIN true
+      ALWAYS true
+      USES_TERMINAL true
+    )
+    ExternalProject_Add_StepTargets(openssl test)
+  endif()
+
   add_library(thirdparty_openssl INTERFACE)
 
   add_dependencies(thirdparty_openssl_ssl openssl)
@@ -197,6 +273,11 @@ function(opensslMain)
   target_link_libraries(thirdparty_openssl INTERFACE
     thirdparty_openssl_ssl
     thirdparty_openssl_crypto
+  )
+
+  # Set compatibility to openssl 1.1.1 APIs until all the libraries are updated to work with openssl 3.x
+  target_compile_definitions(thirdparty_openssl INTERFACE
+    OPENSSL_API_COMPAT=10101
   )
 endfunction()
 

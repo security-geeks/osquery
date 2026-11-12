@@ -6,6 +6,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
 
 option(OSQUERY_THIRD_PARTY_SOURCE_MODULE_WARNINGS "This option can be enable to show all warnings in the source modules. Not recommended" OFF)
+option(OSQUERY_DISABLE_SHALLOW_CLONE "Set this option to ON to do a full git clone. For Development only" OFF)
 
 function(initializeGitSubmodule submodule_path no_recursive shallow)
   file(GLOB submodule_folder_contents "${submodule_path}/*")
@@ -25,7 +26,7 @@ function(initializeGitSubmodule submodule_path no_recursive shallow)
   endif()
 
   set(optional_depth_arg "")
-  if(shallow)
+  if(NOT OSQUERY_DISABLE_SHALLOW_CLONE AND shallow)
     if(GIT_VERSION_STRING VERSION_GREATER_EQUAL "2.14.0")
       set(optional_depth_arg "--depth=1")
     else()
@@ -49,6 +50,21 @@ function(initializeGitSubmodule submodule_path no_recursive shallow)
     RESULT_VARIABLE process_exit_code
     WORKING_DIRECTORY "${working_directory}"
   )
+
+  # A shallow (--depth=1) update only fetches the tip of the submodule's tracked
+  # branch. When the submodule is pinned to a commit that isn't that tip -- for
+  # example after bumping the pin to a tagged release that trails the branch
+  # head -- checking out the recorded commit fails. Fall back to a full,
+  # non-shallow update, which fetches enough history to reach any recorded commit.
+  if(NOT ${process_exit_code} EQUAL 0 AND NOT "${optional_depth_arg}" STREQUAL "")
+    message(WARNING "Shallow update of submodule \"${submodule_path}\" failed; retrying with a full clone.")
+
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" ${optional_protocol_arg} submodule update --init ${optional_recursive_arg} "${submodule_path}"
+      RESULT_VARIABLE process_exit_code
+      WORKING_DIRECTORY "${working_directory}"
+    )
+  endif()
 
   if(NOT ${process_exit_code} EQUAL 0)
     message(FATAL_ERROR "Failed to update the following git submodule: \"${submodule_path}\"")

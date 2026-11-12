@@ -7,15 +7,19 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
-#include <pwd.h>
 #include <grp.h>
+#include <pwd.h>
 #include <sys/stat.h>
+
+#include <sstream>
 
 #include <boost/filesystem.hpp>
 
 #include <osquery/core/tables.h>
 #include <osquery/filesystem/filesystem.h>
 #include <osquery/logger/logger.h>
+#include <osquery/worker/ipc/platform_table_container_ipc.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
 
 namespace fs = boost::filesystem;
 
@@ -23,8 +27,19 @@ namespace osquery {
 namespace tables {
 
 std::vector<std::string> kBinarySearchPaths = {
-    "/bin",           "/sbin",           "/usr/bin", "/usr/sbin",
-    "/usr/local/bin", "/usr/local/sbin", "/tmp",
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    // Homebrew on Apple Silicon, whose default prefix is not /usr/local
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    // MacPorts
+    "/opt/local/bin",
+    "/opt/local/sbin",
+    "/tmp",
 };
 
 Status genBin(const fs::path& path, int perms, QueryData& results) {
@@ -66,67 +81,59 @@ Status genBin(const fs::path& path, int perms, QueryData& results) {
   if ((perms & 02000) == 02000) {
     r["permissions"] += "G";
   }
-
+  r["pid_with_namespace"] = "0";
   results.push_back(r);
   return Status::success();
 }
 
-bool isSuidBin(const fs::path& path, int perms) {
-  if (!fs::is_regular_file(path)) {
-    return false;
-  }
-
-  if ((perms & 04000) == 04000 || (perms & 02000) == 02000) {
-    return true;
-  }
-  return false;
-}
-
-void genSuidBinsFromPath(const std::string& path, QueryData& results) {
+void genSuidBinsFromPath(const std::string& path,
+                         QueryData& results,
+                         Logger& logger) {
   if (!pathExists(path).ok()) {
-    // Creating an iterator on a missing path will except.
     return;
   }
 
-  auto it = fs::recursive_directory_iterator(fs::path(path));
-  fs::recursive_directory_iterator end;
-  while (it != end) {
-    fs::path subpath = *it;
-    try {
-      // Do not traverse symlinked directories.
-      if (fs::is_directory(subpath) && fs::is_symlink(subpath)) {
-        it.no_push();
-      }
+  boost::filesystem::path dir_entry_path;
 
-      int perms = it.status().permissions();
-      if (isSuidBin(subpath, perms)) {
-        // Only emit suid bins.
-        genBin(subpath, perms, results);
-      }
+  // We don't really need the error, but by passing it into
+  // recursive_directory_iterator we invoked the non-throw version.
+  boost::system::error_code ec;
 
-      ++it;
-    } catch (fs::filesystem_error& e) {
-      VLOG(1) << "Cannot read binary from " << subpath;
-      it.no_push();
-      // Try to recover, otherwise break.
-      try {
-        ++it;
-      } catch (fs::filesystem_error& e) {
-        break;
-      }
+  auto dir_entry_it = fs::recursive_directory_iterator(
+      fs::path(path), fs::directory_options::skip_permission_denied, ec);
+
+  for (const auto& dir_entry : dir_entry_it) {
+    dir_entry_path = dir_entry.path();
+
+    if (!fs::is_regular_file(dir_entry_path, ec)) {
+      continue;
+    }
+
+    auto perms = dir_entry.status().permissions();
+    if ((perms & 04000) == 04000 || (perms & 02000) == 02000) {
+      genBin(dir_entry_path, perms, results);
     }
   }
 }
 
-QueryData genSuidBin(QueryContext& context) {
+QueryData genSuidBinImpl(QueryContext& context, Logger& logger) {
   QueryData results;
 
   // Todo: add hidden column to select on that triggers non-std path searches.
   for (const auto& path : kBinarySearchPaths) {
-    genSuidBinsFromPath(path, results);
+    genSuidBinsFromPath(path, results, logger);
   }
 
   return results;
 }
+
+QueryData genSuidBin(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "suid_bin", genSuidBinImpl);
+  } else {
+    GLOGLogger logger;
+    return genSuidBinImpl(context, logger);
+  }
 }
-}
+} // namespace tables
+} // namespace osquery

@@ -84,11 +84,11 @@ This line is created when a worker starts and finds a 'dirty bit' toggled for th
 Lines that indicate the watchdog has taken action include either of the following:
 
 ```text
-osqueryd worker (92234) system performance limits exceeded
-osqueryd worker (8368) memory limits exceeded: 99573760
+osqueryd worker (92234) stopping: Maximum sustainable CPU utilization limit 540ms exceeded for 12 seconds
+osqueryd worker (8368) stopping: Memory limits exceeded: 214532096 bytes (limit is 200MB)
 ```
 
-The pid of the offending worker is included in parenthesis.
+The pid of the offending worker is included in parenthesis, followed by the limit that was exceeded.
 
 If the worker finds itself in a re-occurring error state or the watchdog continues to stop the worker, additional lines like the following are created:
 
@@ -97,6 +97,37 @@ osqueryd worker respawning too quickly: 1 times
 ```
 
 The watchdog implements an exponential backoff when respawning workers and the associated 'dirty' query is denylisted from running for 24 hours.
+
+### Distributed query denylisting
+
+If the watchdog stops the daemon while a distributed query was running then such query will be denylisted from running for 24 hours.
+This behavior is similar to the denylisting of scheduled queries.
+
+When a distributed query is denylisted, the **Distributed write** request POST body will contain a non-zero status for the query and a `"distributed query is denylisted"` message: 
+```json
+{
+  "node_key": "...",
+  "queries": {
+    "id1": [
+      {"column1": "value1", "column2": "value2"},
+      {"column1": "value1", "column2": "value2"}
+    ],
+    "id3": []
+  },
+  "statuses": {
+    "id1": 0,
+    "id3": 1,
+  },
+  "messages": {
+    "id3": "distributed query is denylisted" 
+  }
+}
+```
+
+Additionally, when running in verbose mode, the following line will be generated when a distributed query is denylisted:
+```text
+Not executing distributed denylisted query: "SELECT * FROM hash WHERE path LIKE '/Users/%/%%';"
+```
 
 ### Inspecting daemon state using the shell
 
@@ -154,7 +185,7 @@ $ sudo osqueryctl start
 $ sudo osqueryctl config-check
 E0118 17:10:09.520731 1913696256 init.cpp:421] [Ref #1629] osqueryd initialize failed: Could not open RocksDB
 $ sudo osqueryctl status
-com.facebook.osqueryd is running. pid: 81943
+io.osquery.agent is running. pid: 81943
 $ sudo osqueryctl stop
 $ sudo osqueryctl config-check || echo 'config has an error'
 ```

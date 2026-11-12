@@ -25,6 +25,9 @@
 #include <osquery/utils/config/default_paths.h>
 #include <osquery/utils/system/system.h>
 #include <osquery/core/shutdown.h>
+#include <osquery/filesystem/filesystem.h>
+
+#include <osquery/utils/conversions/windows/strings.h>
 
 DECLARE_string(flagfile);
 
@@ -88,18 +91,17 @@ class ServiceArgumentParser {
       LPWSTR* wargv = ::CommandLineToArgvW(::GetCommandLineW(), &wargc);
 
       if (wargv != nullptr) {
+        owns_argv_ptrs_ = true;
         for (int i = 0; i < wargc; i++) {
           LPSTR arg = toMBString(wargv[i]);
 
           // On error, bail out and clean up the vector
           if (arg == nullptr) {
             cleanArgs();
-            ::LocalFree(wargv);
             break;
           }
           args_.push_back(arg);
         }
-        owns_argv_ptrs_ = true;
         ::LocalFree(wargv);
       }
     }
@@ -343,6 +345,8 @@ void WINAPI ServiceMain(DWORD argc, LPSTR* argv) {
 } // namespace osquery
 
 int main(int argc, char* argv[]) {
+  osquery::initializeFilesystemAPILocale();
+
   SERVICE_TABLE_ENTRYA serviceTable[] = {
       {const_cast<CHAR*>(osquery::kServiceName.c_str()),
        static_cast<LPSERVICE_MAIN_FUNCTIONA>(osquery::ServiceMain)},
@@ -359,9 +363,27 @@ int main(int argc, char* argv[]) {
       retcode = osquery::startOsquery(argc, argv);
     } else {
       // An actual error has occurred at this point
+      retcode = 1;
       SLOG("StartServiceCtrlDispatcherA error (lasterror=" +
            std::to_string(le) + ")");
     }
   }
   return retcode;
+}
+
+int wmain(int argc, wchar_t* wargv[]) {
+  std::vector<std::wstring> wargs(wargv, wargv + argc);
+  std::vector<std::string> copies;
+  std::vector<char*> argv;
+
+  copies.reserve(wargs.size());
+  argv.reserve(wargs.size());
+
+  for (auto& arg : wargs) {
+    auto str = osquery::wstringToString(arg);
+    copies.emplace_back(str);
+    argv.push_back(copies.back().data());
+  }
+
+  return main(argc, &argv[0]);
 }

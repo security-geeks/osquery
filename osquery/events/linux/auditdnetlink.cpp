@@ -71,6 +71,11 @@ DECLARE_bool(audit_allow_seccomp_events);
 namespace {
 
 const std::string kAppArmorRecordMarker{"apparmor="};
+constexpr std::uint64_t kUnprocessedRecordsThreshold{4096};
+// How often in seconds a message should be displayed if throttling happened
+constexpr std::uint64_t kThrottlingMessageInterval{60};
+// How much to wait for each throttling loop in millseconds
+constexpr std::uint64_t kThrottlingDuration{100};
 
 bool IsSELinuxRecord(const audit_reply& reply) noexcept {
   static const auto& selinux_event_set = kSELinuxEventList;
@@ -152,11 +157,17 @@ std::vector<AuditEventRecord> AuditdNetlink::getEvents() noexcept {
     std::unique_lock<std::mutex> queue_lock(
         auditd_context_->processed_events_mutex);
 
-    if (auditd_context_->processed_records_cv.wait_for(
-            queue_lock, std::chrono::seconds(1)) ==
-        std::cv_status::no_timeout) {
+    /* NOTE: we want to wait up to one second for events,
+       but only if there aren't events to be processed already. */
+    auto should_process_events = auditd_context_->processed_records_cv.wait_for(
+        queue_lock, std::chrono::seconds(1), [this]() {
+          return !auditd_context_->processed_events.empty();
+        });
+
+    if (should_process_events) {
       record_list = std::move(auditd_context_->processed_events);
       auditd_context_->processed_events.clear();
+      auditd_context_->processed_records_backlog = 0;
     }
   }
 
@@ -166,7 +177,7 @@ std::vector<AuditEventRecord> AuditdNetlink::getEvents() noexcept {
 AuditdNetlinkReader::AuditdNetlinkReader(AuditdContextRef context)
     : InternalRunnable("AuditdNetlinkReader"),
       auditd_context_(std::move(context)),
-      read_buffer_(4096U) {}
+      read_buffer_(1024U) {}
 
 void AuditdNetlinkReader::start() {
   int counter_to_next_status_request = 0;
@@ -319,7 +330,34 @@ bool AuditdNetlinkReader::acquireMessages() noexcept {
         read_buffer_.begin(),
         std::next(read_buffer_.begin(), events_received));
 
+    auditd_context_->unprocessed_records_amount += events_received;
+
     auditd_context_->unprocessed_records_cv.notify_all();
+  }
+
+  /* Throttle reading if the processing thread cannot keep up,
+   we don't want to use too much memory */
+  while (auditd_context_->unprocessed_records_amount >
+             kUnprocessedRecordsThreshold &&
+         !interrupted()) {
+    ++auditd_context_->netlink_throttling_count;
+    std::this_thread::sleep_for(std::chrono::milliseconds(kThrottlingDuration));
+  }
+
+  /* We want to warn about throttling happening at most every
+     kThrottlingMessageInterval seconds */
+  if (auditd_context_->netlink_throttling_count > 0) {
+    auto now = getUnixTime();
+    if (auditd_context_->last_netlink_throttling_message_time +
+            kThrottlingMessageInterval <=
+        now) {
+      LOG(WARNING) << "The Audit publisher has throttled reading records from "
+                      "Netlink for "
+                   << (auditd_context_->netlink_throttling_count / 10.0f)
+                   << " seconds. Some events may have been lost.";
+      auditd_context_->netlink_throttling_count = 0;
+      auditd_context_->last_netlink_throttling_message_time = now;
+    }
   }
 
   if (reset_handle) {
@@ -328,7 +366,7 @@ bool AuditdNetlinkReader::acquireMessages() noexcept {
   }
 
   return true;
-}
+} // namespace osquery
 
 bool AuditdNetlinkReader::configureAuditService() noexcept {
   VLOG(1) << "Attempting to configure the audit service";
@@ -341,9 +379,6 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
   audit_set_backlog_limit(audit_netlink_handle_, FLAGS_audit_backlog_limit);
   audit_set_failure(audit_netlink_handle_, AUDIT_FAIL_SILENT);
 
-  // Request only the highest priority of audit status messages.
-  set_aumessage_mode(MSG_QUIET, DBG_NO);
-
   //
   // Audit rules
   //
@@ -352,7 +387,7 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
   if (FLAGS_audit_allow_sockets) {
     VLOG(1) << "Enabling audit rules for the socket_events table";
 
-    for (int syscall : kSocketEventsSyscalls) {
+    for (int syscall : getSocketEventsSyscalls()) {
       monitored_syscall_list_.insert(syscall);
     }
   }
@@ -396,8 +431,10 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
   audit_rule_data rule = {};
 
   // Attempt to add each one of the rules we collected
+  int machine = audit_detect_machine();
   for (int syscall_number : monitored_syscall_list_) {
-    audit_rule_syscall_data(&rule, syscall_number);
+    const char* syscall_name = audit_syscall_to_name(syscall_number, machine);
+    audit_rule_syscallbyname_data(&rule, syscall_name);
     if (FLAGS_audit_debug) {
       VLOG(1) << "Audit rule queued for syscall " << syscall_number;
     }
@@ -414,14 +451,19 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
   // clang-format on
 
   if (rule_add_error < 0) {
+    const char* errno_message = audit_errno_to_name(-rule_add_error);
     LOG(ERROR) << "Failed to install the audit rule due to one or more "
-               << "syscalls with error " << audit_errno_to_name(rule_add_error)
+               << "syscalls with error "
+               << (errno_message ? errno_message : "NULL")
                << ", Audit-based tables may not function as expected";
+
   } else if (FLAGS_audit_debug) {
     VLOG(1) << "Audit rule installed for all queued syscalls";
   }
 
-  if (FLAGS_audit_force_unconfigure) {
+  if (FLAGS_audit_force_unconfigure || rule_add_error >= 0) {
+    // keep a track of the rule even if installing it failed when asked to
+    // forcefully unconfigure.
     installed_rule_list_.push_back(rule);
   }
 
@@ -578,8 +620,13 @@ void AuditdNetlinkReader::restoreAuditServiceConfiguration() noexcept {
   VLOG(1) << "Uninstalling the audit rules we have installed";
 
   for (auto& rule : installed_rule_list_) {
-    audit_delete_rule_data(
+    int rule_delete_error = audit_delete_rule_data(
         audit_netlink_handle_, &rule, AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
+    if (FLAGS_audit_debug && rule_delete_error < 0) {
+      const char* errno_message = audit_errno_to_name(-rule_delete_error);
+      VLOG(1) << "Error code returned by delete rule "
+              << (errno_message ? errno_message : "NULL");
+    }
   }
 
   installed_rule_list_.clear();
@@ -599,7 +646,7 @@ NetlinkStatus AuditdNetlinkReader::acquireHandle() noexcept {
     }
 
     errno = 0;
-    if (audit_request_status(netlink_handle) < 0 && errno != ENOBUFS) {
+    if (audit_request_status(netlink_handle) <= 0 && errno != ENOBUFS) {
       VLOG(1) << "Failed to query the audit netlink status";
       return NetlinkStatus::Error;
     }
@@ -634,7 +681,7 @@ NetlinkStatus AuditdNetlinkReader::acquireHandle() noexcept {
     return NetlinkStatus::Error;
   }
 
-  if (audit_set_pid(audit_netlink_handle_, getpid(), WAIT_NO) < 0) {
+  if (audit_set_pid(audit_netlink_handle_, getpid(), WAIT_NO) <= 0) {
     VLOG(1) << "Failed to set the netlink owner";
 
     audit_close(audit_netlink_handle_);
@@ -647,7 +694,7 @@ NetlinkStatus AuditdNetlinkReader::acquireHandle() noexcept {
   if (FLAGS_audit_allow_config &&
       (netlink_status != NetlinkStatus::ActiveMutable &&
        netlink_status != NetlinkStatus::ActiveImmutable)) {
-    if (audit_set_enabled(audit_netlink_handle_, AUDIT_ENABLED) < 0) {
+    if (audit_set_enabled(audit_netlink_handle_, AUDIT_ENABLED) <= 0) {
       VLOG(1) << "Failed to enable the audit service";
 
       audit_close(audit_netlink_handle_);
@@ -686,7 +733,11 @@ void AuditdNetlinkParser::start() {
       std::unique_lock<std::mutex> lock(
           auditd_context_->unprocessed_records_mutex);
 
-      while (auditd_context_->unprocessed_records.empty() && !interrupted()) {
+      while (auditd_context_->unprocessed_records.empty()) {
+        if (interrupted()) {
+          return;
+        }
+
         auditd_context_->unprocessed_records_cv.wait_for(
             lock, std::chrono::seconds(1));
       }
@@ -753,11 +804,45 @@ void AuditdNetlinkParser::start() {
           audit_event_record_queue.begin(),
           audit_event_record_queue.end());
 
+      auditd_context_->processed_records_backlog =
+          auditd_context_->processed_events.size();
+
       auditd_context_->processed_records_cv.notify_all();
     }
 
+    auditd_context_->unprocessed_records_amount -= queue.size();
     queue.clear();
     audit_event_record_queue.clear();
+
+    /* Throttling the record processing if the consumer (the publisher)
+       cannot keep up */
+    while (auditd_context_->processed_records_backlog >
+               kUnprocessedRecordsThreshold &&
+           !interrupted()) {
+      ++auditd_context_->processing_throttling_count;
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(kThrottlingDuration));
+    }
+
+    /* We want to warn about throttling happening at most every
+       kThrottlingMessageInterval seconds */
+    if (auditd_context_->processing_throttling_count > 0) {
+      auto now = getUnixTime();
+      if (auditd_context_->last_processing_throttling_message_time +
+              kThrottlingMessageInterval <=
+          now) {
+        /* NOTE: this is meant as a debugging message since throttling here
+           doesn't mean that events will be lost. It might cause throttling on
+           the reading side, but if that happens a warning
+           will be given there */
+        VLOG(1) << "The Audit publisher has throttled record processing for "
+                << (auditd_context_->processing_throttling_count / 10.0f)
+                << " seconds. This may cause further throttling and loss of "
+                   "events.";
+        auditd_context_->processing_throttling_count = 0;
+        auditd_context_->last_processing_throttling_message_time = now;
+      }
+    }
   }
 }
 

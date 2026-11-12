@@ -36,51 +36,44 @@ from gentable import *
 # This data structure represents the directories in specs/ and how they map to
 # the operating systems which support tables found in those directories
 PLATFORM_DIRS = {
-    "specs": ["darwin", "linux", "windows", "freebsd"],
-    "utility": ["darwin", "linux", "freebsd", "windows"],
-    "yara": ["darwin", "linux"],
-    "smart": ["darwin", "linux"],
+    "specs": ["darwin", "linux", "windows"],
+    "utility": ["darwin", "linux", "windows"],
     "darwin": ["darwin"],
-    "freebsd": ["freebsd"],
-    "kernel": ["darwin"],
+    "linwin": ["linux", "windows"],
     "linux": ["linux"],
-    "lldpd": ["linux"],
     "macwin": ["darwin", "windows"],
     "posix": ["darwin", "linux"],
-    "sleuthkit": ["darwin", "linux"],
     "windows": ["windows"],
 }
+
+BASE_SOURCE_URL = "https://github.com/osquery/osquery/blob/master"
 
 def platform_for_spec(path):
     """Given a path to a table specification, return a list of what osquery
     platforms that table will work on. In the event that no match is found, it
     will be assumed that the table is found on all platforms.
     """
+
     full_path = os.path.abspath(path)
     directory_list = os.path.dirname(full_path).split("/")
     directory = directory_list[len(directory_list)-1]
-    try:
-        return PLATFORM_DIRS[directory]
-    except KeyError:
-        return ["darwin", "linux", "freebsd", "windows"]
+    return PLATFORM_DIRS[directory]
 
-def url_for_spec(path):
+def remove_prefix(text, prefix):
+    # python 3.9 has `removeprefix`, but I don't want to add that requirement.
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
+def url_for_spec(specs_dir, path):
     """Given a path to a table specification, return the URL that would take you
     to the specification on GitHub.
     """
-    full_path = os.path.abspath(path)
-    url = "https://github.com/osquery/osquery/blob/master"
-    osquery_found = False
-    for part in full_path.split("/"):
-        if osquery_found:
-            url = url + "/" + part
-        elif part == "osquery":
-            osquery_found = True
-        else:
-            continue
+    path_fragment = remove_prefix(path, specs_dir).lstrip("/ ")
+    url = os.path.join(BASE_SOURCE_URL, "specs", path_fragment)
     return url
 
-def generate_table_metadata(full_path):
+def generate_table_metadata(specs_dir, full_path):
     """This function generates a dictionary of table metadata for a spec file
     found at a given path."""
     with open(full_path, "r") as file_handle:
@@ -96,10 +89,12 @@ def generate_table_metadata(full_path):
         t = {}
         t["name"] = table.table_name
         t["description"] = table.description
-        t["url"] = url_for_spec(full_path)
+        t["url"] = url_for_spec(specs_dir, full_path)
         t["platforms"] = platform_for_spec(full_path)
         t["evented"] = "event_subscriber" in table.attributes
         t["cacheable"] = "cacheable" in table.attributes
+        t["notes"] = table.notes
+        t["examples"] = table.examples
 
         # Now we must iterate through `table.columns` to collect information
         # about each column
@@ -109,20 +104,13 @@ def generate_table_metadata(full_path):
             c["name"] = col.name
             c["description"] = col.description
             c["type"] = col.type.affinity.replace("_TYPE", "").lower()
+            c["notes"] = col.notes
 
-            hidden = False
-            required = False
-            index = False
-            for option in col.options:
-                if option == "hidden":
-                    hidden = True
-                elif option == "required":
-                    required = True
-                elif option == "index":
-                    index == True
-            c["hidden"] = hidden
-            c["required"] = required
-            c["index"] = index
+            c["hidden"] = col.options.get("hidden", False)
+            c["required"] = col.options.get("required", False)
+            c["index"] = col.options.get("index", False)
+            if col.platforms != []:
+                c["platforms"] = col.platforms
 
             t["columns"].append(c)
     return t
@@ -138,9 +126,14 @@ def main(argc, argv):
 
     for subdir, dirs, files in os.walk(specs_dir):
         for filename in files:
+            # Skip the example spec in the spec/ dir.
+            # There is no actual example table in osquery so it should not be generated into the docs.
+            if filename == "example.table":
+                continue
+
             if filename.endswith(".table"):
                 full_path = os.path.join(subdir, filename)
-                metadata = generate_table_metadata(full_path)
+                metadata = generate_table_metadata(specs_dir, full_path)
                 tables[metadata["name"]] = metadata
 
     # Print the JSON output to stdout

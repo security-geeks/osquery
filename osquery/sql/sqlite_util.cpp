@@ -27,15 +27,15 @@
 
 namespace osquery {
 
-FLAG(string,
-     disable_tables,
-     "",
-     "Comma-delimited list of table names to be disabled");
+CLI_FLAG(string,
+         disable_tables,
+         "",
+         "Comma-delimited list of table names to be disabled");
 
-FLAG(string,
-     enable_tables,
-     "",
-     "Comma-delimited list of table names to be enabled");
+CLI_FLAG(string,
+         enable_tables,
+         "",
+         "Comma-delimited list of table names to be enabled");
 
 FLAG(string, nullvalue, "", "Set string for NULL values, default ''");
 
@@ -223,6 +223,28 @@ class StringEscaperVisitor : public boost::static_visitor<> {
   }
 };
 
+class SizeVisitor : public boost::static_visitor<> {
+ public:
+  void operator()(const long long& i) {
+    size = sizeof(i);
+  }
+
+  void operator()(const double& d) {
+    size = sizeof(d);
+  }
+
+  void operator()(const std::string& t) {
+    size = t.length();
+  }
+
+  uint64_t get_size() const {
+    return size;
+  }
+
+ private:
+  uint64_t size{0};
+};
+
 void SQLInternal::escapeResults() {
   StringEscaperVisitor visitor;
   for (auto& rowTyped : resultsTyped_) {
@@ -230,6 +252,19 @@ void SQLInternal::escapeResults() {
       boost::apply_visitor(visitor, column.second);
     }
   }
+}
+
+uint64_t SQLInternal::getSize() {
+  SizeVisitor visitor;
+  uint64_t size = 0;
+  for (const auto& row : rowsTyped()) {
+    for (const auto& column : row) {
+      size += column.first.size();
+      boost::apply_visitor(visitor, column.second);
+      size += visitor.get_size();
+    }
+  }
+  return size;
 }
 
 Status SQLiteSQLPlugin::attach(const std::string& name) {
@@ -241,7 +276,6 @@ Status SQLiteSQLPlugin::attach(const std::string& name) {
   }
 
   bool is_extension = true;
-  auto statement = columnDefinition(response, false, is_extension);
 
   // Attach requests occurring via the plugin/registry APIs must act on the
   // primary database. To allow this, getConnection can explicitly request the
@@ -249,7 +283,7 @@ Status SQLiteSQLPlugin::attach(const std::string& name) {
   auto dbc = SQLiteDBManager::getConnection(true);
 
   // Attach as an extension, allowing read/write tables
-  return attachTableInternal(name, statement, dbc, is_extension);
+  return attachTableInternal(name, dbc, is_extension);
 }
 
 Status SQLiteSQLPlugin::detach(const std::string& name) {
@@ -307,6 +341,9 @@ static inline void openOptimized(sqlite3*& db) {
   }
   sqlite3_exec(db, settings.c_str(), nullptr, nullptr, nullptr);
 
+  // Register versioning collations and function.
+  registerVersionExtensions(db);
+
   // Register function extensions.
   registerMathExtensions(db);
 #if !defined(FREEBSD)
@@ -318,6 +355,7 @@ static inline void openOptimized(sqlite3*& db) {
   registerFilesystemExtensions(db);
   registerHashingExtensions(db);
   registerEncodingExtensions(db);
+  registerNetworkExtensions(db);
 
   auto rc = sqlite3_set_authorizer(db, &sqliteAuthorizer, nullptr);
   if (rc != SQLITE_OK) {
@@ -349,11 +387,11 @@ RecursiveLock SQLiteDBInstance::attachLock() const {
 void SQLiteDBInstance::addAffectedTable(
     std::shared_ptr<VirtualTableContent> table) {
   // An xFilter/scan was requested for this virtual table.
-  affected_tables_.insert(std::make_pair(table->name, std::move(table)));
+  affected_tables_.emplace(table.get(), std::move(table));
 }
 
 bool SQLiteDBInstance::tableCalled(VirtualTableContent const& table) {
-  return (affected_tables_.count(table.name) > 0);
+  return (affected_tables_.count(&table) > 0);
 }
 
 TableAttributes SQLiteDBInstance::getAttributes() const {
@@ -512,10 +550,33 @@ QueryPlanner::QueryPlanner(const std::string& query,
 
   for (const auto& row : plan) {
     auto details = osquery::split(row.at("detail"));
-    if (details.size() > 2 && details[0] == "SCAN") {
-      tables_.push_back(details[2]);
+    if (details.size() > 1 && details[0] == "SCAN") {
+      tables_.push_back(details[1]);
     }
   }
+
+  // An alias is a virtual table using its table's module; report that table.
+  {
+    auto lock = instance->attachLock();
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(instance->db(),
+                       "SELECT substr(sql, length('CREATE VIRTUAL TABLE ' || "
+                       "name || ' USING ') + 1) FROM sqlite_temp_master WHERE "
+                       "name = ?1 AND sql LIKE 'CREATE VIRTUAL TABLE %'",
+                       -1,
+                       &stmt,
+                       nullptr);
+    for (auto& table : tables_) {
+      sqlite3_bind_text(stmt, 1, table.c_str(), -1, SQLITE_TRANSIENT);
+      if (sqlite3_step(stmt) == SQLITE_ROW) {
+        table = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+      }
+      sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+  }
+
+  instance->clearAffectedTables();
 }
 
 Status QueryPlanner::applyTypes(TableColumns& columns) {

@@ -44,6 +44,7 @@ function(generateOsqueryTablesEventsEventstable)
     list(APPEND source_files
       darwin/disk_events.cpp
       darwin/es_process_events.cpp
+      darwin/es_process_file_events.cpp
       darwin/file_events.cpp
       darwin/hardware_events.cpp
       darwin/socket_events.cpp
@@ -57,6 +58,13 @@ function(generateOsqueryTablesEventsEventstable)
       windows/powershell_events.cpp
       windows/windows_events.cpp
     )
+	
+    if(OSQUERY_BUILD_ETW)
+      list(APPEND source_files
+      windows/etw_process_events.cpp
+      windows/dns_lookup_events.cpp
+      )
+    endif()	
   endif()
 
   add_osquery_library(osquery_tables_events_eventstable EXCLUDE_FROM_ALL
@@ -109,6 +117,10 @@ function(generateOsqueryTablesEventsEventstable)
     add_test(NAME osquery_tables_events_tests_seccompeventstests-test COMMAND osquery_tables_events_tests_seccompeventstests-test)
     add_test(NAME osquery_tables_events_tests_selinuxeventstests-test COMMAND osquery_tables_events_tests_selinuxeventstests-test)
     add_test(NAME osquery_tables_events_tests_processeventstests-test COMMAND osquery_tables_events_tests_processeventstests-test)
+
+    if(OSQUERY_BUILD_BPF)
+      add_test(NAME osquery_tables_events_tests_bpftests-test COMMAND osquery_tables_events_tests_bpftests-test)
+    endif()
   endif()
 
   if(DEFINED PLATFORM_WINDOWS)
@@ -117,6 +129,13 @@ function(generateOsqueryTablesEventsEventstable)
       windows/powershell_events.h
       windows/windows_events.h
     )
+	
+    if(OSQUERY_BUILD_ETW)
+      list(APPEND platform_public_header_files
+      windows/etw_process_events.h
+      windows/dns_lookup_events.h
+      )
+    endif()
 
     generateIncludeNamespace(osquery_tables_events_eventstable "osquery/tables/events" "FULL_PATH" ${platform_public_header_files})
   endif()

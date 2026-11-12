@@ -7,18 +7,24 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
+#include <algorithm>
 #include <sstream>
 #include <utility>
 
+#include <osquery/core/flags.h>
 #include <osquery/core/plugins/logger.h>
 #include <osquery/core/system.h>
 #include <osquery/database/database.h>
 #include <osquery/distributed/distributed.h>
+#include <osquery/hashing/hashing.h>
 #include <osquery/logger/logger.h>
+#include <osquery/process/process.h>
 #include <osquery/registry/registry_factory.h>
 #include <osquery/sql/sql.h>
+#include <osquery/utils/conversions/tryto.h>
 #include <osquery/utils/json/json.h>
 #include <osquery/utils/system/time.h>
+#include <osquery/worker/system/memory.h>
 
 namespace rj = rapidjson;
 
@@ -33,7 +39,23 @@ FLAG(bool,
      true,
      "Disable distributed queries (default true)");
 
-const std::string kDistributedQueryPrefix{"distributed."};
+FLAG(bool,
+     distributed_loginfo,
+     false,
+     "Log the running distributed queries name at INFO level");
+
+FLAG(uint64,
+     distributed_denylist_duration,
+     86400,
+     "Seconds to denylist distributed queries (default 1 day)");
+
+FLAG(uint64,
+     distributed_results_max_bytes,
+     32 * 1024 * 1024,
+     "Maximum size in bytes of distributed query results kept to retry after "
+     "a failed write; larger results are dropped (0 = unlimited)");
+
+DECLARE_bool(verbose);
 
 std::string Distributed::currentRequestId_{""};
 
@@ -79,10 +101,10 @@ Status Distributed::pullUpdates() {
   return Status::success();
 }
 
-size_t Distributed::getPendingQueryCount() {
+std::vector<std::string> Distributed::getPendingQueries() {
   std::vector<std::string> queries;
-  scanDatabaseKeys(kQueries, queries, kDistributedQueryPrefix);
-  return queries.size();
+  scanDatabaseKeys(kDistributedQueries, queries);
+  return queries;
 }
 
 size_t Distributed::getCompletedCount() {
@@ -94,48 +116,158 @@ Status Distributed::serializeResults(std::string& json) {
   auto queries_obj = doc.getObject();
   auto statuses_obj = doc.getObject();
   auto messages_obj = doc.getObject();
+  auto stats_obj = doc.getObject();
   for (const auto& result : results_) {
     auto arr = doc.getArray();
     auto s = serializeQueryData(result.results, result.columns, doc, arr);
     if (!s.ok()) {
       return s;
     }
-    doc.add(result.request.id, arr, queries_obj);
-    doc.add(result.request.id, result.status.getCode(), statuses_obj);
-    doc.add(result.request.id, result.message, messages_obj);
+    doc.addCopy(result.request.id, arr, queries_obj);
+    doc.addCopy(result.request.id, result.status.getCode(), statuses_obj);
+    doc.addCopy(result.request.id, result.message, messages_obj);
+
+    auto obj = doc.getObject();
+    if (performance_.count(result.request.id) > 0) {
+      auto perf = performance_[result.request.id];
+      obj.AddMember("wall_time_ms",
+                    static_cast<uint64_t>(perf.wall_time_ms),
+                    obj.GetAllocator());
+      obj.AddMember("user_time",
+                    static_cast<uint64_t>(perf.user_time),
+                    obj.GetAllocator());
+      obj.AddMember("system_time",
+                    static_cast<uint64_t>(perf.system_time),
+                    obj.GetAllocator());
+      obj.AddMember("memory",
+                    static_cast<uint64_t>(perf.last_memory),
+                    obj.GetAllocator());
+    };
+
+    doc.addCopy(result.request.id, obj, stats_obj);
   }
 
-  doc.add("queries", queries_obj);
-  doc.add("statuses", statuses_obj);
-  doc.add("messages", messages_obj);
+  doc.addCopy("queries", queries_obj);
+  doc.addCopy("statuses", statuses_obj);
+  doc.addCopy("messages", messages_obj);
+  doc.addCopy("stats", stats_obj);
   return doc.toString(json);
 }
 
 void Distributed::addResult(const DistributedQueryResult& result) {
-  results_.push_back(result);
+  // Results are written keyed by query ID, so only the latest result for an
+  // ID is sent. Replace a result kept from a failed write rather than keeping
+  // both, since a server may reissue the same ID while writes keep failing.
+  auto existing = std::find_if(
+      results_.begin(), results_.end(), [&result](const auto& kept) {
+        return kept.request.id == result.request.id;
+      });
+  if (existing != results_.end()) {
+    *existing = result;
+  } else {
+    results_.push_back(result);
+  }
 }
 
 Status Distributed::runQueries() {
-  while (getPendingQueryCount() > 0) {
-    auto request = popRequest();
-    LOG(INFO) << "Executing distributed query: " << request.id << ": "
+  auto queries = getPendingQueries();
+
+  for (const auto& query : queries) {
+    auto request = popRequest(query);
+
+    const auto denylisted = checkAndSetAsRunning(request.query);
+    if (denylisted) {
+      VLOG(1) << "Not executing distributed denylisted query: \""
+              << request.query << "\"";
+      DistributedQueryResult result;
+      result.request = request;
+      result.status = Status(1, "Denylisted");
+      result.message = "distributed query is denylisted";
+      addResult(result);
+      continue;
+    }
+
+    if (FLAGS_verbose) {
+      VLOG(1) << "Executing distributed query: " << request.id << ": "
               << request.query;
+    } else if (FLAGS_distributed_loginfo) {
+      LOG(INFO) << "Executing distributed query: " << request.id << ": "
+                << request.query;
+    }
 
     // Keep track of the currently executing request
     Distributed::setCurrentRequestId(request.id);
 
-    SQL sql(request.query);
+    auto sql = monitorNonnumeric(request.id, request.query);
     const auto ok = sql.getStatus().ok();
     const auto& msg = ok ? "" : sql.getMessageString();
     if (!ok) {
       LOG(ERROR) << "Error executing distributed query: " << request.id << ": "
                  << msg;
     }
+
+    setAsNotRunning(request.query);
+
     DistributedQueryResult result(
         request, sql.rows(), sql.columns(), sql.getStatus(), msg);
     addResult(result);
   }
   return flushCompleted();
+}
+
+bool Distributed::checkAndSetAsRunning(const std::string& query) {
+  std::string ts;
+  const auto queryKey = hashQuery(query);
+  auto status = getDatabaseValue(kDistributedRunningQueries, queryKey, ts);
+  if (status.ok()) {
+    return !denylistedQueryTimestampExpired(ts);
+  }
+  status = setDatabaseValue(
+      kDistributedRunningQueries, queryKey, std::to_string(getUnixTime()));
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to set distributed query as running: \"" << query
+               << "\" (hash: " << queryKey << ")";
+  }
+  return false;
+}
+
+void Distributed::setAsNotRunning(const std::string& query) {
+  const auto queryKey = hashQuery(query);
+  return setKeyAsNotRunning(queryKey);
+}
+
+void Distributed::setKeyAsNotRunning(const std::string& queryKey) {
+  const auto status = deleteDatabaseValue(kDistributedRunningQueries, queryKey);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to delete running distributed query with hash: "
+               << queryKey << ", status: " << status.getMessage();
+  }
+}
+
+Status Distributed::cleanupExpiredRunningQueries() {
+  std::vector<std::string> queryKeys;
+  const auto status = scanDatabaseKeys(kDistributedRunningQueries, queryKeys);
+
+  if (queryKeys.size() > 0) {
+    VLOG(1) << "Found " << queryKeys.size()
+            << " distributed queries marked as denylisted";
+  }
+
+  for (const auto& queryKey : queryKeys) {
+    std::string ts;
+    const auto status =
+        getDatabaseValue(kDistributedRunningQueries, queryKey, ts);
+    if (!status.ok()) {
+      LOG(ERROR) << "Failed to remove expired running distributed query: "
+                 << queryKey;
+      continue;
+    }
+    if (denylistedQueryTimestampExpired(ts)) {
+      VLOG(1) << "Removing expired running distributed query: " << queryKey;
+      setKeyAsNotRunning(queryKey);
+    }
+  }
+  return Status::success();
 }
 
 Status Distributed::flushCompleted() {
@@ -154,13 +286,33 @@ Status Distributed::flushCompleted() {
     return s;
   }
 
+  VLOG(1) << "Writing " << results_.size() << " distributed query results ("
+          << results.size() << " bytes)";
+
   PluginResponse response;
   s = Registry::call("distributed",
                      {{"action", "writeResults"}, {"results", results}},
                      response);
   if (s.ok()) {
     results_.clear();
+    performance_.clear();
+  } else if (FLAGS_distributed_results_max_bytes > 0 &&
+             results.size() > FLAGS_distributed_results_max_bytes) {
+    // Failed results are kept to retry with the next flush. If writes keep
+    // failing while new queries are still received, for example because the
+    // server rejects the request size, they would grow without bound.
+    LOG(WARNING) << "Dropping " << results_.size()
+                 << " distributed query results (" << results.size()
+                 << " bytes) that could not be written: " << s.getMessage();
+    results_.clear();
+    performance_.clear();
   }
+
+#ifdef OSQUERY_LINUX
+  // Attempt to release some unused memory kept by malloc internal caching
+  releaseRetainedMemory();
+#endif
+
   return s;
 }
 
@@ -170,8 +322,9 @@ Status Distributed::acceptWork(const std::string& work) {
     return Status(1, "Error Parsing JSON");
   }
 
-  std::set<std::string> queries_to_run;
-  // Check for and run discovery queries first
+  // Check for and run discovery queries first.
+  // Store their result in discovery_results.
+  std::map<std::string, bool> discovery_results;
   if (doc.doc().HasMember("discovery")) {
     const auto& queries = doc.doc()["discovery"];
     assert(queries.IsObject());
@@ -192,9 +345,7 @@ Status Distributed::acceptWork(const std::string& work) {
         if (!sql.getStatus().ok()) {
           return Status(1, "Distributed discovery query has an SQL error");
         }
-        if (sql.rows().size() > 0) {
-          queries_to_run.insert(name);
-        }
+        discovery_results.insert({name, (sql.rows().size() > 0)});
       }
     }
   }
@@ -215,8 +366,12 @@ Status Distributed::acceptWork(const std::string& work) {
           return Status(1, "Distributed query is not a string");
         }
 
-        if (queries_to_run.empty() || queries_to_run.count(name)) {
-          setDatabaseValue(kQueries, kDistributedQueryPrefix + name, query);
+        // If a query does not have a corresponding discovery query
+        // or it does and it returned results, then store the query
+        // for execution.
+        const auto result = discovery_results.find(name);
+        if (result == discovery_results.cend() || result->second) {
+          setDatabaseValue(kDistributedQueries, name, query);
         }
       }
     }
@@ -237,17 +392,12 @@ Status Distributed::acceptWork(const std::string& work) {
   return Status::success();
 }
 
-DistributedQueryRequest Distributed::popRequest() {
-  // Read all pending queries.
-  std::vector<std::string> queries;
-  scanDatabaseKeys(kQueries, queries, kDistributedQueryPrefix);
-
-  // Set the last-most-recent query as the request, and delete it.
-  DistributedQueryRequest request;
-  const auto& next = queries.front();
-  request.id = next.substr(kDistributedQueryPrefix.size());
-  getDatabaseValue(kQueries, next, request.query);
-  deleteDatabaseValue(kQueries, next);
+DistributedQueryRequest Distributed::popRequest(std::string query) {
+  // Prepare a request from the query and then remove it from the database.
+  DistributedQueryRequest request{};
+  request.id = query;
+  getDatabaseValue(kDistributedQueries, query, request.query);
+  deleteDatabaseValue(kDistributedQueries, query);
   return request;
 }
 
@@ -257,6 +407,74 @@ std::string Distributed::getCurrentRequestId() {
 
 void Distributed::setCurrentRequestId(const std::string& cReqId) {
   currentRequestId_ = cReqId;
+}
+
+SQL Distributed::monitorNonnumeric(const std::string& name,
+                                   const std::string& query) {
+  // Snapshot the performance and times for the worker before running.
+  auto pid = std::to_string(PlatformProcess::getCurrentPid());
+  auto r0 = SQL::selectFrom({"resident_size", "user_time", "system_time"},
+                            "processes",
+                            "pid",
+                            EQUALS,
+                            pid);
+
+  using namespace std::chrono;
+  auto t0 = steady_clock::now();
+  SQL sql(query, true);
+
+  // Snapshot the performance after, and compare.
+  auto t1 = steady_clock::now();
+  auto r1 = SQL::selectFrom({"resident_size", "user_time", "system_time"},
+                            "processes",
+                            "pid",
+                            EQUALS,
+                            pid);
+  if (r0.size() > 0 && r1.size() > 0) {
+    // Always called while processes table is working.
+    uint64_t size = sql.rows().size();
+    recordQueryPerformance(
+        name, duration_cast<milliseconds>(t1 - t0).count(), size, r0[0], r1[0]);
+  }
+  return sql;
+}
+
+void Distributed::recordQueryPerformance(const std::string& name,
+                                         uint64_t delay_ms,
+                                         uint64_t size,
+                                         const Row& r0,
+                                         const Row& r1) {
+  performance_[name] = QueryPerformance();
+
+  auto& query = performance_.at(name);
+  if (!r1.at("user_time").empty() && !r0.at("user_time").empty()) {
+    auto ut1 = tryTo<long long>(r1.at("user_time"));
+    auto ut0 = tryTo<long long>(r0.at("user_time"));
+    auto diff = (ut1 && ut0) ? ut1.take() - ut0.take() : 0;
+    if (diff > 0) {
+      query.user_time = diff;
+    }
+  }
+
+  if (!r1.at("system_time").empty() && !r0.at("system_time").empty()) {
+    auto st1 = tryTo<long long>(r1.at("system_time"));
+    auto st0 = tryTo<long long>(r0.at("system_time"));
+    auto diff = (st1 && st0) ? st1.take() - st0.take() : 0;
+    if (diff > 0) {
+      query.system_time = diff;
+    }
+  }
+
+  if (!r1.at("resident_size").empty() && !r0.at("resident_size").empty()) {
+    auto rs1 = tryTo<long long>(r1.at("resident_size"));
+    auto rs0 = tryTo<long long>(r0.at("resident_size"));
+    auto diff = (rs1 && rs0) ? rs1.take() - rs0.take() : 0;
+    if (diff > 0) {
+      query.last_memory = diff;
+    }
+  }
+
+  query.wall_time_ms = delay_ms;
 }
 
 Status serializeDistributedQueryRequest(const DistributedQueryRequest& r,
@@ -315,8 +533,8 @@ Status serializeDistributedQueryResult(const DistributedQueryResult& r,
     return s;
   }
 
-  doc.add("request", request_obj);
-  doc.add("results", results_arr);
+  doc.addCopy("request", request_obj);
+  doc.addCopy("results", results_arr);
   return Status::success();
 }
 
@@ -359,4 +577,19 @@ Status deserializeDistributedQueryResultJSON(const std::string& json,
   }
   return deserializeDistributedQueryResult(doc.doc(), r);
 }
+
+bool denylistedQueryTimestampExpired(const std::string& timestamp) {
+  const auto ts = tryTo<uint64_t>(timestamp, 10).takeOr(uint64_t(0));
+  return getUnixTime() > ts + denylistDuration();
+}
+
+std::string hashQuery(const std::string& query) {
+  return hashFromBuffer(
+      HashType::HASH_TYPE_SHA256, query.c_str(), query.length());
+}
+
+uint64_t denylistDuration() {
+  return FLAGS_distributed_denylist_duration;
+}
+
 } // namespace osquery

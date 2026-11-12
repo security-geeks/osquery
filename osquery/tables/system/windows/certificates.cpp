@@ -19,17 +19,15 @@
 
 #include <osquery/core/tables.h>
 #include <osquery/logger/logger.h>
-#include <osquery/process/windows/process_ops.h>
 #include <osquery/sql/sql.h>
 
+#include <osquery/filesystem/fileops.h>
+#include <osquery/tables/system/windows/certificates.h>
 #include <osquery/utils/conversions/join.h>
 #include <osquery/utils/conversions/tryto.h>
 #include <osquery/utils/conversions/windows/strings.h>
 #include <osquery/utils/conversions/windows/windows_time.h>
-
-#include <osquery/filesystem/fileops.h>
-#include <osquery/tables/system/windows/certificates.h>
-#include <osquery/tables/system/windows/users.h>
+#include <osquery/utils/system/windows/users_groups_helpers.h>
 
 namespace fs = boost::filesystem;
 
@@ -177,7 +175,7 @@ std::string getLocalizedStoreName(LPCWSTR storeNameW) {
  * Expects @name to be the `lpServiceStartName` from
  * `QueryServiceConfig`
  */
-std::string getSidFromAccountName(const std::string& name) {
+std::string getServiceSidFromAccountName(const std::string& name) {
   // `lpServiceStartName` has been observed to contain both uppercase
   // and lowercase versions of these values
   if (boost::iequals(name, "LocalSystem")) {
@@ -267,7 +265,7 @@ std::string getServiceSid(const std::string& serviceNameOrSid,
     }
 
     std::string accountName = results[0]["user_account"];
-    sid = getSidFromAccountName(accountName);
+    sid = getServiceSidFromAccountName(accountName);
     service2sidCache[serviceName] = sid;
   }
 
@@ -427,33 +425,34 @@ void addCertRow(PCCERT_CONTEXT certContext,
                     static_cast<unsigned long>(certBuff.size()));
   r["common_name"] = wstringToString(certBuff.data());
 
-  auto subjSize = CertNameToStr(certContext->dwCertEncodingType,
-                                &(certContext->pCertInfo->Subject),
-                                CERT_SIMPLE_NAME_STR,
-                                nullptr,
-                                0);
-  certBuff.resize(subjSize, 0);
-  std::fill(certBuff.begin(), certBuff.end(), 0);
-  subjSize = CertNameToStr(certContext->dwCertEncodingType,
-                           &(certContext->pCertInfo->Subject),
-                           CERT_SIMPLE_NAME_STR,
-                           certBuff.data(),
-                           subjSize);
-  r["subject"] = subjSize == 0 ? "" : wstringToString(certBuff.data());
+  // Convert a distinguished name blob to a string using the given format flag.
+  // CERT_SIMPLE_NAME_STR yields only the attribute values (legacy
+  // subject/issuer behavior), while CERT_X500_NAME_STR preserves the attribute
+  // keys (OIDs), e.g. "CN=Example, O=Example Inc, C=US"
+  auto nameBlobToString = [&](PCERT_NAME_BLOB nameBlob,
+                              DWORD strType) -> std::string {
+    auto size = CertNameToStr(
+        certContext->dwCertEncodingType, nameBlob, strType, nullptr, 0);
+    if (size == 0) {
+      return ""; // defensive: CertNameToStr is documented to return >= 1
+    }
+    std::vector<WCHAR> nameBuff(size, 0);
+    size = CertNameToStr(certContext->dwCertEncodingType,
+                         nameBlob,
+                         strType,
+                         nameBuff.data(),
+                         size);
+    return size == 0 ? "" : wstringToString(nameBuff.data());
+  };
 
-  auto issuerSize = CertNameToStr(certContext->dwCertEncodingType,
-                                  &(certContext->pCertInfo->Issuer),
-                                  CERT_SIMPLE_NAME_STR,
-                                  nullptr,
-                                  0);
-  certBuff.resize(issuerSize, 0);
-  std::fill(certBuff.begin(), certBuff.end(), 0);
-  issuerSize = CertNameToStr(certContext->dwCertEncodingType,
-                             &(certContext->pCertInfo->Issuer),
-                             CERT_SIMPLE_NAME_STR,
-                             certBuff.data(),
-                             issuerSize);
-  r["issuer"] = issuerSize == 0 ? "" : wstringToString(certBuff.data());
+  r["subject"] = nameBlobToString(&(certContext->pCertInfo->Subject),
+                                  CERT_SIMPLE_NAME_STR);
+  r["subject2"] =
+      nameBlobToString(&(certContext->pCertInfo->Subject), CERT_X500_NAME_STR);
+  r["issuer"] =
+      nameBlobToString(&(certContext->pCertInfo->Issuer), CERT_SIMPLE_NAME_STR);
+  r["issuer2"] =
+      nameBlobToString(&(certContext->pCertInfo->Issuer), CERT_X500_NAME_STR);
 
   // TODO(#5654) 1: Find the right API calls to get whether a cert is for a CA
   r["ca"] = INTEGER(-1);
@@ -477,8 +476,13 @@ void addCertRow(PCCERT_CONTEXT certContext,
 
   r["key_usage"] = getKeyUsage(certContext->pCertInfo);
 
-  r["key_strength"] = INTEGER(
-      (certContext->pCertInfo->SubjectPublicKeyInfo.PublicKey.cbData) * 8);
+  auto keyStrength = CertGetPublicKeyLength(
+      CERT_ENCODING, &certContext->pCertInfo->SubjectPublicKeyInfo);
+  if (keyStrength == 0) {
+    VLOG(1) << "Failed to get public key length with " << GetLastError();
+  } else {
+    r["key_strength"] = INTEGER(keyStrength);
+  }
 
   std::vector<BYTE> keypropBuff;
   getCertCtxProp(certContext, CERT_KEY_IDENTIFIER_PROP_ID, keypropBuff);
@@ -605,8 +609,16 @@ void findUserPersonalCertsOnDisk(const std::string& username,
           encodedCert.data(),
           static_cast<unsigned long>(encodedCert.size()));
 
+      if (ctx == nullptr) {
+        VLOG(1) << "Failed to create certificate context with ("
+                << GetLastError() << ")";
+        continue;
+      }
+
       addCertRow(
           ctx, storeId, sid, storeName, username, storeLocation, results);
+
+      CertFreeCertificateContext(ctx);
     }
   } catch (const fs::filesystem_error& e) {
     VLOG(1) << "Error traversing " << certsPath.str() << ": " << e.what();

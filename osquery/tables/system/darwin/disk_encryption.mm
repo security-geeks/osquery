@@ -19,6 +19,7 @@
 #include <osquery/events/darwin/diskarbitration.h>
 #include <osquery/logger/logger.h>
 #include <osquery/sql/sql.h>
+#include <osquery/tables/system/posix/disk_encryption.h>
 #include <osquery/utils/conversions/darwin/iokit.h>
 
 namespace osquery {
@@ -36,15 +37,12 @@ const std::string kAPFSFileSystem = "apfs";
 const std::string kFileVaultStatusOn = "on";
 const std::string kFileVaultStatusOff = "off";
 const std::string kFileVaultStatusUnknown = "unknown";
-const std::string kEncryptionStatusEncrypted = "encrypted";
-const std::string kEncryptionStatusUndefined = "undefined";
-const std::string kEncryptionStatusNotEncrypted = "not encrypted";
 
 /// Expect all device names to include a /dev path prefix.
 const std::string kDeviceNamePrefix = "/dev/";
 
 const std::set<std::string> kHardcodedDiskUUIDs = {
-    "EBC6C064-0000-11AA-AA11-00306543ECA",
+    "EBC6C064-0000-11AA-AA11-00306543ECAC",
     "64C0C6EB-0000-11AA-AA11-00306543ECAC",
     "C064EBC6-0000-11AA-AA11-00306543ECAC",
     "ec1c2ad9-b618-4ed6-bd8d-50f361c27507",
@@ -418,7 +416,7 @@ void genFDEStatusForBSDName(const std::string& bsd_name,
       uuid_string_t uuid_string = {0};
       if (genUid(uid, uuid_string).ok()) {
         r["uid"] = BIGINT(uid);
-        r["user_uuid"] = TEXT(uuid_string);
+        r["user_uuid"] = SQL_TEXT(uuid_string);
       }
     }
     r["type"] = (r.at("encrypted") == "1") ? kEncryptionType : std::string();
@@ -429,27 +427,65 @@ void genFDEStatusForBSDName(const std::string& bsd_name,
   IOObjectRelease(service);
 }
 
-bool isAPFS(const QueryData& result) {
-  return !result.empty() && result[0].count("type") > 0 &&
-         result[0].at("type") == kAPFSFileSystem;
+bool isAPFS(const std::unordered_map<std::string, bool>& lookup,
+            const std::string& key) {
+  auto it = lookup.find(key);
+
+  if (it == lookup.end()) {
+    return false;
+  }
+
+  // We only need to check the first mount -- the rest should be the same.
+  return it->second;
 }
 
 QueryData genFDEStatus(QueryContext& context) {
   QueryData results;
 
-  auto block_devices = SQL::selectAllFrom("block_devices");
+  // For a given device, we need to tell if it's an apfs. We do this
+  // by looking at the type column from the mounts table. Fetch this
+  // here, so don't have to keep refetching.
+  std::unordered_map<std::string, bool> deviceIsAPFS;
+  for (const auto& row : SQL::selectAllFrom("mounts")) {
+    std::string device, type;
+    for (const auto& [k, v] : row) {
+      if (k == "device") {
+        device = v;
+      } else if (k == "type") {
+        type = v;
+      }
+    }
+    if (!device.empty() && !type.empty()) {
+      deviceIsAPFS[device] = type == kAPFSFileSystem;
+    }
+  }
+
+  bool runSelectAll(true);
+  QueryData block_devices;
+
+  if (auto constraint_it = context.constraints.find("name");
+      constraint_it != context.constraints.end()) {
+    const auto& constraints = constraint_it->second;
+    for (const auto& name : constraints.getAll(EQUALS)) {
+      runSelectAll = false;
+
+      auto data = SQL::selectAllFrom("block_devices", "name", EQUALS, name);
+      for (const auto& row : data) {
+        block_devices.push_back(row);
+      }
+    }
+  }
+
+  if (runSelectAll) {
+    block_devices = SQL::selectAllFrom("block_devices");
+  }
+
   for (const auto& row : block_devices) {
     auto name = row.at("name");
-    // FIXME: fetching all mounts is not efficient, we need to
-    // fetch all mounts before loop
-    auto mount = SQL::selectAllFrom("mounts", "device", EQUALS, name);
     @autoreleasepool {
       const auto bsd_name = name.substr(kDeviceNamePrefix.size());
-      if (mount.size() > 1) {
-        assert(false && "Found multiple mounts for one device!");
-        LOG(ERROR) << "Found multiple mounts for " << name;
-      }
-      genFDEStatusForBSDName(bsd_name, row.at("uuid"), isAPFS(mount), results);
+      genFDEStatusForBSDName(
+          bsd_name, row.at("uuid"), isAPFS(deviceIsAPFS, name), results);
     }
   }
   return results;

@@ -18,6 +18,7 @@
 #include <osquery/utils/conversions/join.h>
 #include <osquery/utils/conversions/split.h>
 #include <osquery/utils/conversions/tryto.h>
+#include <osquery/utils/info/firmware.h>
 
 namespace osquery {
 namespace tables {
@@ -101,14 +102,20 @@ bool LinuxSMBIOSParser::discoverTables(size_t address, size_t length) {
 }
 
 bool LinuxSMBIOSParser::discover() {
-  if (osquery::isReadable(kLinuxDMISysfsPath)) {
+  if (osquery::isReadable(kLinuxDMISysfsPath, true)) {
     VLOG(1) << "Reading SMBIOS from sysfs DMI node";
     readFromSysfs(kLinuxDMISysfsPath);
-  } else if (osquery::isReadable(kLinuxEFISystabPath)) {
+  } else if (osquery::isReadable(kLinuxEFISystabPath, true)) {
     VLOG(1) << "Reading SMBIOS from EFI provided memory location";
     readFromSystab(kLinuxEFISystabPath);
   } else {
+    // The 0xF0000 scan assumes PC/AT firmware layout; can SIGBUS elsewhere.
+#if defined(__x86_64__) || defined(__i386__)
     readFromAddress(kLinuxSMBIOSRawAddress_, kLinuxSMBIOSRawLength_);
+#else
+    VLOG(1) << "No SMBIOS data: sysfs DMI and EFI systab are unavailable, and "
+               "the raw memory fallback is x86-only";
+#endif
   }
   return valid();
 }
@@ -259,7 +266,7 @@ QueryData genPlatformInfo(QueryContext& context) {
                             uint8_t* address,
                             uint8_t* textAddrs,
                             size_t size) {
-    const size_t maxOffset = 0x15;
+    const size_t maxOffset = 0x15 + 1;
     if (hdr->type != kSMBIOSTypeBIOS || size < maxOffset) {
       return;
     }
@@ -270,6 +277,16 @@ QueryData genPlatformInfo(QueryContext& context) {
     r["vendor"] = dmiString(textAddrs, address[0x04], maxlen);
     r["version"] = dmiString(textAddrs, address[0x05], maxlen);
     r["date"] = dmiString(textAddrs, address[0x08], maxlen);
+
+    auto opt_firmware_kind = getFirmwareKind();
+    if (opt_firmware_kind.has_value()) {
+      const auto& firmware_kind = opt_firmware_kind.value();
+      r["firmware_type"] = getFirmwareKindDescription(firmware_kind);
+
+    } else {
+      LOG(ERROR) << "platform_info: Failed to determine the firmware type";
+      r["firmware_type"] = "unknown";
+    }
 
     // Firmware load address as a WORD.
     size_t firmware_address = (address[0x07] << 8) + address[0x06];

@@ -55,7 +55,6 @@ You may be wondering how osquery handles cross-platform support while still allo
 - General Linux: [specs/linux/](https://github.com/osquery/osquery/tree/master/specs/linux)
 - Windows: [specs/windows/](https://github.com/osquery/osquery/tree/master/specs/windows)
 - POSIX: [specs/posix/](https://github.com/osquery/osquery/tree/master/specs/posix)
-- FreeBSD: [specs/freebsd/](https://github.com/osquery/osquery/tree/master/specs/freebsd)
 - You get the picture ;)
 
 > NOTICE: the CMake build provides custom defines for each platform and platform version.
@@ -70,6 +69,7 @@ Each column in a **specfile** may have keyword arguments that effect how the SQL
 - **index=True**: This sets the `PRIMARY KEY` for the table, which helps the SQLite optimizer remove potential duplicates from complex `JOIN`s. If multiple columns have `index=True` then a primary key is created as the set of columns.
 - **additional=True**: This is weird, but use **additional** if the presence of the column in the predicate would somehow alter the logic in the table generator. This tells SQLite not to optimize out any use of this column in the predicate.
 - **hidden=True**: Sets the `HIDDEN` attribute for the column, so a `SELECT * FROM` will not include this column.
+- **optimized=True**: Use **optimized** if the presence of the column in the predicate reduces the generated dataset. The table generator must iterate over all constraints for the column as this tells the SQLite optimizer it will process `IN` constraints all-at-once. As well, the table generator must be able to handle empty string constraints for an optimized column.
 
 The table may also set `attributes`:
 

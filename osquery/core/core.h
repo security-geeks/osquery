@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include <osquery/utils/macros/macros.h>
@@ -19,6 +20,6 @@
 namespace osquery {
 
 /// Custom literal for size_t.
-uint64_t operator"" _sz(unsigned long long int x);
+uint64_t operator""_sz(unsigned long long int x);
 
 } // namespace osquery

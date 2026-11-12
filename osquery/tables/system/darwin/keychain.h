@@ -9,21 +9,13 @@
 
 #pragma once
 
-#include <map>
 #include <set>
 #include <vector>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
 
-#include <openssl/x509v3.h>
-#include <openssl/bn.h>
-#include <openssl/asn1.h>
-#include <openssl/x509.h>
-#include <openssl/x509_vfy.h>
-#include <openssl/pem.h>
-#include <openssl/bio.h>
-
+#include <osquery/core/flags.h>
 #include <osquery/core/tables.h>
 
 namespace osquery {
@@ -31,52 +23,68 @@ namespace tables {
 
 extern const std::vector<std::string> kSystemKeychainPaths;
 extern const std::vector<std::string> kUserKeychainPaths;
+extern const std::map<std::string, SecTrustSettingsDomain>
+    kSecTrustSettingsDomains;
 
-// The flags are defined in openssl/x509v3.h,
-// and its keys in crypto/x509v3/v3_bitst.c
-// clang-format off
-const std::map<uint32_t, std::string> kKeyUsageFlags = {
-    {0x0001, "Encipher Only"},
-    {0x0002, "CRL Sign"},
-    {0x0004, "Key Cert Sign"},
-    {0x0008, "Key Agreement"},
-    {0x0010, "Data Encipherment"},
-    {0x0020, "Key Encipherment"},
-    {0x0040, "Non Repudiation"},
-    {0x0080, "Digital Signature"},
-    {0x8000, "Decipher Only"}};
-// clang-format on
+// Declare keychain flags. They are defined in keychain_utils.cpp.
+DECLARE_bool(keychain_access_cache); // enable flag
+DECLARE_uint32(keychain_access_interval); // throttling flag
 
-void genKeychains(const std::string& path, CFMutableArrayRef& keychains);
+// The tables supported by Keychain Cache
+enum class KeychainTable { CERTIFICATES, KEYCHAIN_ACLS, KEYCHAIN_ITEMS };
+
+// The KeychainCache caches results associated with keychain files,
+// and throttles access to these files.
+class KeychainCache {
+ private:
+  // KeychainCacheEntry contains cache metadata and cached results
+  // for a single keychain file.
+  class KeychainCacheEntry {
+   public:
+    std::chrono::system_clock::time_point timestamp; // time of last access
+    std::string hash; // sha256 keychain file hash
+    QueryData results; // the cached results
+  };
+  std::map<std::pair<boost::filesystem::path, KeychainTable>,
+           KeychainCacheEntry>
+      cache;
+
+ public:
+  // Read checks the hash and returns 1 for a cache hit or 0 for a cache miss.
+  // If hit, results are populated. hash is the file hash
+  bool Read(const boost::filesystem::path& path,
+            KeychainTable table,
+            std::string& hash,
+            QueryData& results,
+            bool& err);
+  // Write a cache entry.
+  void Write(const boost::filesystem::path& path,
+             KeychainTable table,
+             const std::string& hash,
+             const QueryData& results);
+  size_t Size() {
+    return cache.size();
+  }
+};
+extern KeychainCache keychainCache;
+extern std::mutex keychainMutex;
+
+// Expand paths to individual files
+std::set<std::string> expandPaths(const std::set<std::string>& paths);
+
 std::string getKeychainPath(const SecKeychainItemRef& item);
 
-/// Certificate property parsing functions.
-std::string genKIDProperty(const unsigned char* data, int len);
-
-/// Generate the public key algorithm and signing algorithm.
-void genAlgorithmProperties(X509* cert,
-                            std::string& key,
-                            std::string& sig,
-                            std::string& size);
-
-/// Generate common name and subject.
-void genCommonName(X509* cert,
-                   std::string& subject,
-                   std::string& common_name,
-                   std::string& issuer);
-time_t genEpoch(ASN1_TIME* time);
-
-std::string genSHA1ForCertificate(X509* cert);
-std::string genSerialForCertificate(X509* cert);
-bool CertificateIsCA(X509* cert);
-bool CertificateIsSelfSigned(X509* cert);
-
 /// Generate a list of keychain items for a given item type.
-CFArrayRef CreateKeychainItems(const std::set<std::string>& paths,
+CFArrayRef CreateKeychainItems(CFMutableArrayRef keychains,
                                const CFTypeRef& item_type);
 
+/// Returns true if the given keychain file path resides on the Signed System
+/// Volume (under /System/Library/Keychains) and is therefore read-only and
+/// safe to open via SecKeychainOpen. On macOS 26+, opening a live non-SSV
+/// keychain file can corrupt it, so callers should copy the file to a private
+/// temp location and open the copy instead.
+bool isSSVProtectedPath(const std::string& path);
+
 std::set<std::string> getKeychainPaths();
-std::string genKeyUsage(uint32_t flag);
-std::string genHumanReadableDateTime(ASN1_TIME* time);
-}
-}
+} // namespace tables
+} // namespace osquery

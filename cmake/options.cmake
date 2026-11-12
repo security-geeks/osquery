@@ -45,8 +45,9 @@ function(detectOsqueryVersion)
   string(REPLACE "." ";" osquery_version_components "${osquery_version}")
 
   list(LENGTH osquery_version_components osquery_version_components_len)
+
   if(NOT osquery_version_components_len GREATER_EQUAL 3)
-    message(FATAL_ERROR "Version should have at least 3 components (semvar).")
+    message(FATAL_ERROR "Version should have at least 3 components (semver).")
   endif()
 
   set(OSQUERY_VERSION_INTERNAL "${osquery_version}" PARENT_SCOPE)
@@ -71,40 +72,69 @@ option(OSQUERY_NO_DEBUG_SYMBOLS "Whether to build without debug symbols or not, 
 option(OSQUERY_BUILD_TESTS "Whether to enable and build tests or not")
 option(OSQUERY_BUILD_ROOT_TESTS "Whether to enable and build tests that require root access")
 
-if(DEFINED PLATFORM_LINUX)
-  option(OSQUERY_BUILD_FUZZERS "Whether to build fuzzing harnesses")
-  option(OSQUERY_ENABLE_ADDRESS_SANITIZER "Whether to enable Address Sanitizer")
-  # This is required for Boost coroutines/context to be built in a way that are compatible to Valgrind
-  option(OSQUERY_ENABLE_VALGRIND_SUPPORT "Whether to enable support for osquery to be run under Valgrind")
+# Sanitizers
+option(OSQUERY_ENABLE_ADDRESS_SANITIZER "Whether to enable Address Sanitizer")
 
-  if(OSQUERY_ENABLE_VALGRIND_SUPPORT AND OSQUERY_ENABLE_ADDRESS_SANITIZER)
-    message(FATAL_ERROR "Cannot mix Vagrind and ASAN sanitizers, please choose only one.")
+if(DEFINED PLATFORM_POSIX)
+  option(OSQUERY_ENABLE_THREAD_SANITIZER "Whether to enable Thread Sanitizer")
+endif()
+
+if(DEFINED PLATFORM_LINUX OR DEFINED PLATFORM_WINDOWS)
+  option(OSQUERY_BUILD_FUZZERS "Whether to build fuzzing harnesses")
+
+  if(DEFINED PLATFORM_WINDOWS AND OSQUERY_BUILD_FUZZERS)
+    if(OSQUERY_MSVC_TOOLSET_VERSION LESS 143)
+      message(FATAL_ERROR "Fuzzers are not supported on MSVC toolset version less than 143")
+    endif()
+  endif()
+
+  if(DEFINED PLATFORM_LINUX)
+    option(OSQUERY_ENABLE_LEAK_SANITIZER "Whether to enable Leak Sanitizer")
+
+    # This is required for Boost coroutines/context to be built in a way that are compatible to Valgrind
+    option(OSQUERY_ENABLE_VALGRIND_SUPPORT "Whether to enable support for osquery to be run under Valgrind")
+
+    if(OSQUERY_ENABLE_VALGRIND_SUPPORT AND OSQUERY_ENABLE_ADDRESS_SANITIZER)
+      message(FATAL_ERROR "Cannot mix Vagrind and ASAN sanitizers, please choose only one.")
+    endif()
   endif()
 endif()
 
 if(DEFINED PLATFORM_WINDOWS)
   option(OSQUERY_ENABLE_INCREMENTAL_LINKING "Whether to enable or disable incremental linking (/INCREMENTAL or /INCREMENTAL:NO). Enabling it greatly increases disk usage")
+  option(OSQUERY_BUILD_ETW "Whether to enable and build ETW support" ON)
 endif()
 
 option(OSQUERY_ENABLE_CLANG_TIDY "Enables clang-tidy support")
 set(OSQUERY_CLANG_TIDY_CHECKS "-checks=cert-*,cppcoreguidelines-*,performance-*,portability-*,readability-*,modernize-*,bugprone-*" CACHE STRING "List of checks performed by clang-tidy")
 
 option(OSQUERY_BUILD_BPF "Whether to enable and build BPF support" ON)
-option(OSQUERY_BUILD_AWS "Whether to build the aws tables and library, to decrease memory usage and increase speed during build." ON)
-option(OSQUERY_BUILD_DPKG "Whether to build the dpkg tables" ON)
 
-# This is a temporary option to ignore the version check if there's no intention to generate RPM packages
-option(OSQUERY_IGNORE_CMAKE_MAX_VERSION_CHECK "Ignore the maximum cmake version check introduced due to CPack generating incorrect RPM packages")
+set(DEFAULT_BUILD_AWS ON)
+if(DEFINED PLATFORM_WINDOWS AND "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "ARM64")
+    message(WARNING "AWS dependency is disabled on windows-arm64 because of missing atomics support")
+    set(DEFAULT_BUILD_AWS OFF)
+endif()
+option(OSQUERY_BUILD_AWS "Whether to build the aws tables and library, to decrease memory usage and increase speed during build." ${DEFAULT_BUILD_AWS})
+
+option(OSQUERY_BUILD_DPKG "Whether to build the dpkg tables" ON)
+option(OSQUERY_BUILD_EXPERIMENTS "Whether to build experiments" ON)
 
 option(OSQUERY_ENABLE_FORMAT_ONLY "Configure CMake to format only, not build")
 
 # Unfortunately, due glog always enabling BUILD_TESTING, we have to force it off, so that tests won't be built
 overwrite_cache_variable("BUILD_TESTING" "BOOL" "OFF")
 
+if(DEFINED PLATFORM_POSIX)
+  option(OSQUERY_ENABLE_CCACHE "Whether to search ccache in the system and use it in the build" ON)
+endif()
+
 set(third_party_source_list "source;formula")
 
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/modules" CACHE STRING "A list of paths containing CMake module files")
 set(OSQUERY_THIRD_PARTY_SOURCE "${third_party_source_list}" CACHE STRING "Sources used to acquire third-party dependencies")
+
+set(OSQUERY_INSTALL_DIRECTIVES "${CMAKE_SOURCE_DIR}/cmake/install_directives.cmake" CACHE FILEPATH "Install directives")
 
 # This is the default S3 storage used by Facebook to store 3rd party dependencies; it
 # is provided here as a configuration option
@@ -112,6 +142,23 @@ if("${THIRD_PARTY_REPOSITORY_URL}" STREQUAL "")
   set(THIRD_PARTY_REPOSITORY_URL "https://s3.amazonaws.com/osquery-packages")
 endif()
 
+# When building on macOS, make sure we are only building one architecture at a time
+if(PLATFORM_MACOS)
+  list(LENGTH CMAKE_OSX_ARCHITECTURES osx_arch_count)
+
+  if(osx_arch_count GREATER 1)
+    message(FATAL_ERROR "The CMAKE_OSX_ARCHITECTURES setting can only contain one architecture at a time")
+  endif()
+endif()
+
+# OSQUERY_USER_AGENT_PREFIX sets the User-Agent prefix osqueryd sends to the
+# TLS server back-end (e.g. for the config and logger endpoints). The osquery
+# version is appended to this prefix, so the default of "osquery/" produces a
+# User-Agent such as "osquery/5.0.0". This can also be overridden at run time
+# with the --tls_user_agent flag.
+set(OSQUERY_USER_AGENT_PREFIX "osquery/" CACHE STRING "User-Agent prefix used for TLS requests to the server back-end")
+
 detectOsqueryVersion()
 
 message(STATUS "osquery version: ${OSQUERY_VERSION_INTERNAL}")
+message(STATUS "osquery User-Agent prefix: ${OSQUERY_USER_AGENT_PREFIX}")

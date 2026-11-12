@@ -129,7 +129,8 @@ void YARAEventSubscriber::configure() {
 
 Status YARAEventSubscriber::Callback(const FileEventContextRef& ec,
                                      const FileSubscriptionContextRef& sc) {
-  if (ec->action != "UPDATED" && ec->action != "CREATED") {
+  if (ec->action != "UPDATED" && ec->action != "CREATED" &&
+      ec->action != "MOVED_TO") {
     return Status(1, "Invalid action");
   }
 
@@ -155,14 +156,14 @@ Status YARAEventSubscriber::Callback(const FileEventContextRef& ec,
   std::shared_ptr<YARAConfigParserPlugin> yaraParser;
   try {
     yaraParser = std::dynamic_pointer_cast<YARAConfigParserPlugin>(parser);
-  } catch (const std::bad_cast& e) {
+  } catch (const std::bad_cast&) {
     return Status(1, "Error casting yara config parser plugin");
   }
   if (yaraParser == nullptr || yaraParser.get() == nullptr) {
     return Status(1, "Yara parser unknown.");
   }
 
-  auto rules = yaraParser->rules();
+  const auto& rules = yaraParser->rules();
 
   // Use the category as a lookup into the yara file_paths. The value will be
   // a list of signature groups to scan with.
@@ -173,7 +174,16 @@ Status YARAEventSubscriber::Callback(const FileEventContextRef& ec,
   if (group_iter != yara_paths.MemberEnd()) {
     for (const auto& rule : group_iter->value.GetArray()) {
       std::string group = rule.GetString();
-      int result = yr_rules_scan_file(rules[group],
+
+      auto rule_it = rules.find(group);
+
+      if (rule_it == rules.end()) {
+        VLOG(1) << "Yara rules group " + group + " not found, skipping it";
+
+        continue;
+      }
+
+      int result = yr_rules_scan_file(rule_it->second.get(),
                                       ec->path.c_str(),
                                       SCAN_FLAGS_FAST_MODE,
                                       YARACallback,
@@ -192,4 +202,4 @@ Status YARAEventSubscriber::Callback(const FileEventContextRef& ec,
 
   return Status::success();
 }
-}
+} // namespace osquery

@@ -1,8 +1,15 @@
-# Security Issues
+# Security Vulnerability Disclosure
+
+This document contains a reference history of osquery's remediated security vulnerabilities. If you find a
+vulnerability, please report it privately via GitHub's security advisory form ("Report a vulnerability" on the
+[Security Advisories](https://github.com/osquery/osquery/security/advisories/new) page). If you believe a CVE should
+be assigned, that can be discussed in the advisory - the maintainers use GitHub's Security Advisory features to request one.
+
+## Security Issues
 
 This document aggregates security issues (weaknesses and vulnerabilities) affecting osquery. It tracks issues in the format:
 
-```
+```text
 #PRNumber Title - (Optional CVE) - Fixed in Version - Optional Reporter
 ```
 

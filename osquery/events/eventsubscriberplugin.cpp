@@ -168,18 +168,23 @@ Status EventSubscriberPlugin::addBatch(std::vector<Row>& row_list,
       return status;
     }
 
-    auto it = context.event_index.find(event_time);
-    if (it == context.event_index.end()) {
-      context.event_index.insert({event_time, event_id_list});
+    {
+      WriteLock lock(context.event_index_mutex);
 
-    } else {
-      auto& index_entry = it->second;
-      index_entry.insert(
-          index_entry.end(), event_id_list.begin(), event_id_list.end());
+      auto it = context.event_index.find(event_time);
+      if (it == context.event_index.end()) {
+        context.event_index.insert({event_time, event_id_list});
+
+      } else {
+        auto& index_entry = it->second;
+        index_entry.insert(
+            index_entry.end(), event_id_list.begin(), event_id_list.end());
+      }
     }
 
+    cleanup_events = (((event_count_ % kEventsCheckpoint) + row_list.size()) >=
+                      kEventsCheckpoint);
     event_count_ += row_list.size();
-    cleanup_events = ((event_count_ % kEventsCheckpoint) == 0U);
   }
 
   // Use the last EventID and a checkpoint bucket size to periodically apply
@@ -268,18 +273,15 @@ void EventSubscriberPlugin::generateRows(std::function<void(Row)> callback,
   }
 
   {
-    auto last = generateRows(this->context,
-                             getDatabase(),
-                             callback,
-                             start_time,
-                             stop_time,
-                             optimize_eid);
+    auto result = generateRows(this->context,
+                               getDatabase(),
+                               callback,
+                               start_time,
+                               stop_time,
+                               optimize_eid);
 
-    if (can_optimize && shouldOptimize()) {
-      if (last != this->context.event_index.end()) {
-        auto last_eid = last->second.empty() ? 0 : last->second.back();
-        setOptimizeData(getDatabase(), last->first, last_eid);
-      }
+    if (can_optimize && shouldOptimize() && !result.isEnd) {
+      setOptimizeData(getDatabase(), result.last_time, result.last_id);
     }
   }
 
@@ -606,6 +608,15 @@ void EventSubscriberPlugin::expireEventBatches(Context& context,
 
     auto range_start = context.event_index.begin();
     auto range_end = context.event_index.upper_bound(oldest_valid_time);
+    // Ensure that we leave the set of events corresponding to the last valid
+    // timestamp. This is because the events are scanned at osquery startup to
+    // determine the next event ID to generate. If all events are expired, we
+    // restart event IDs at 1, potentially losing events that have been ingested
+    // but not yet returned by queries. See
+    // https://github.com/osquery/osquery/issues/8524
+    if (range_end != range_start && range_end == context.event_index.end()) {
+      --range_end;
+    }
 
     expired_event_batch_list.insert(std::make_move_iterator(range_start),
                                     std::make_move_iterator(range_end));
@@ -634,61 +645,93 @@ void EventSubscriberPlugin::expireEventBatches(Context& context,
   }
 }
 
-EventIndex::iterator EventSubscriberPlugin::generateRows(
+EventSubscriberPlugin::GenerateRowsResult EventSubscriberPlugin::generateRows(
     Context& context,
     IDatabaseInterface& db_interface,
     std::function<void(Row)> callback,
     EventTime start_time,
     EventTime end_time,
     EventID last_eid) {
-  auto last = context.event_index.end();
-  if (end_time != 0 && start_time > end_time) {
-    return last;
-  }
+  EventSubscriberPlugin::GenerateRowsResult ret{true, 0, 0};
+  std::vector<EventID> collected_event_id_list;
+  {
+    ReadLock lock(context.event_index_mutex);
+    auto last = context.event_index.end();
+    if (end_time != 0 && start_time > end_time) {
+      return ret;
+    }
 
-  EventIndex::iterator lower_bound_it;
-  if (start_time == 0U) {
-    lower_bound_it = context.event_index.begin();
+    EventIndex::iterator lower_bound_it;
+    if (start_time == 0U) {
+      lower_bound_it = context.event_index.begin();
 
-  } else {
-    lower_bound_it = context.event_index.lower_bound(start_time);
-    if (lower_bound_it == context.event_index.end()) {
-      return last;
+    } else {
+      lower_bound_it = context.event_index.lower_bound(start_time);
+      if (lower_bound_it == context.event_index.end()) {
+        return ret;
+      }
+    }
+
+    auto upper_bound_it = (end_time == 0U)
+                              ? context.event_index.end()
+                              : context.event_index.upper_bound(end_time);
+
+    bool loggedWarning{false};
+    for (auto it = lower_bound_it; it != upper_bound_it; ++it) {
+      const auto& event_id_list = it->second;
+
+      for (const auto& event_identifier : event_id_list) {
+        if (last_eid >= event_identifier) {
+          // Events that are optimized away by this if statement should only be
+          // from the same time (in seconds) as the start_time. If we see events
+          // that are from later than that time, it indicates that there is some
+          // issue with either the optimization data or the event IDs that have
+          // been generated. See https://github.com/osquery/osquery/issues/8524
+          // for one possible case.
+          if (!loggedWarning && it->first > start_time + 1) {
+            LOG(WARNING)
+                << "May be an error in events optimization causing data loss. "
+                   "Please report in a GitHub issue. start_time: "
+                << start_time << " end_time: " << end_time
+                << " last_eid: " << last_eid
+                << " event_identifier: " << event_identifier
+                << " event_time: " << it->first;
+            loggedWarning = true;
+          }
+
+          // A previous optimized query has already visited this event.
+          continue;
+        }
+        collected_event_id_list.push_back(event_identifier);
+      }
+      last = it;
+    }
+
+    if (last != context.event_index.end()) {
+      ret = EventSubscriberPlugin::GenerateRowsResult{
+          false, last->first, last->second.empty() ? 0 : last->second.back()};
     }
   }
-
-  auto upper_bound_it = (end_time == 0U)
-                            ? context.event_index.end()
-                            : context.event_index.upper_bound(end_time);
 
   std::vector<std::string> invalid_key_list;
-  for (auto it = lower_bound_it; it != upper_bound_it; ++it) {
-    const auto& event_id_list = it->second;
+  for (const auto& event_identifier : collected_event_id_list) {
+    auto key = databaseKeyForEventId(context, event_identifier);
 
-    for (const auto& event_identifier : event_id_list) {
-      if (last_eid >= event_identifier) {
-        // A previous optimized query has already visited this event.
-        continue;
-      }
-      auto key = databaseKeyForEventId(context, event_identifier);
-
-      std::string serialized_row;
-      auto status = db_interface.getDatabaseValue(kEvents, key, serialized_row);
-      if (serialized_row.empty()) {
-        invalid_key_list.push_back(key);
-        continue;
-      }
-
-      Row row = {};
-      status = deserializeRowJSON(serialized_row, row);
-      if (!status.ok()) {
-        invalid_key_list.push_back(key);
-        continue;
-      }
-
-      callback(std::move(row));
+    std::string serialized_row;
+    auto status = db_interface.getDatabaseValue(kEvents, key, serialized_row);
+    if (serialized_row.empty()) {
+      invalid_key_list.push_back(key);
+      continue;
     }
-    last = it;
+
+    Row row = {};
+    status = deserializeRowJSON(serialized_row, row);
+    if (!status.ok()) {
+      invalid_key_list.push_back(key);
+      continue;
+    }
+
+    callback(std::move(row));
   }
 
   if (!invalid_key_list.empty()) {
@@ -704,7 +747,8 @@ EventIndex::iterator EventSubscriberPlugin::generateRows(
     LOG(ERROR) << "Found " << invalid_key_list.size() << " invalid events ("
                << erased_key_count << " have been successfully erased)";
   }
-  return last;
+
+  return ret;
 }
 
 const std::string EventSubscriberPlugin::dbNamespace() const {

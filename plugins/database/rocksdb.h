@@ -10,6 +10,7 @@
 #include <atomic>
 
 #include <rocksdb/db.h>
+#include <rocksdb/version.h>
 
 #include <osquery/core/core.h>
 #include <osquery/database/database.h>
@@ -78,7 +79,7 @@ class RocksDBDatabasePlugin : public DatabasePlugin {
   /// Database workflow: close and cleanup.
   void tearDown() override;
 
-  /// Need to tear down open resources,
+  /// Need to tear down open resources.
   virtual ~RocksDBDatabasePlugin() {
     close();
   }
@@ -111,6 +112,9 @@ class RocksDBDatabasePlugin : public DatabasePlugin {
    * @return nothing.
    */
   void repairDB();
+
+  /// Open the database, filling db_ and handles_.
+  rocksdb::Status openDB();
 
   /// Flush memtables and trigger compaction.
   void flush();
@@ -151,5 +155,7 @@ class RocksDBDatabasePlugin : public DatabasePlugin {
  private:
   friend class GlogRocksDBLogger;
   FRIEND_TEST(RocksDBDatabasePluginTests, test_corruption);
+  FRIEND_TEST(RocksDBDatabasePluginTests, test_column_families_rollback);
+  FRIEND_TEST(RocksDBDatabasePluginTests, test_events_ttl);
 };
 } // namespace osquery

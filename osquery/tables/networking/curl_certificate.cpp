@@ -114,14 +114,14 @@ static std::string certificate_extensions(X509* cert, int nid) {
 
   // remove the ending newline from the extension value
   auto length = bio_buf->length;
-  if (bio_buf->data[length - 1] == '\n' || bio_buf->data[length - 1] == '\r') {
-    bio_buf->data[length - 1] = '\0';
+  for (auto i = 0; length > 0 && i < 2; i++) {
+    if (bio_buf->data[length - 1] == '\n' ||
+        bio_buf->data[length - 1] == '\r') {
+      length--;
+    }
   }
 
-  if (bio_buf->data[length] == '\n' || bio_buf->data[length] == '\r') {
-    bio_buf->data[length] = '\0';
-  }
-  auto ident = std::string(bio_buf->data, bio_buf->length);
+  auto ident = std::string(bio_buf->data, length);
 
   // Replace the newline character with the comma
   std::replace(ident.begin(), ident.end(), '\n', ';');
@@ -299,6 +299,9 @@ Status getTLSCertificate(const std::string& hostname,
     return Status::failure("Failed to create OpenSSL CTX object");
   }
 
+  // Do not negotiate TLS 1.0 or 1.1, as done by the TLS transport.
+  SSL_CTX_set_options(ctx.get(), SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+
   std::string port = "443";
   auto connect_hostname = hostname;
   auto delim = hostname.find(":");
@@ -406,23 +409,48 @@ Status getTLSCertificate(const std::string& hostname,
 
   // blocking mode
   SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
-
+  auto cert_failure = Status::failure("No certificate");
   ret = SSL_connect(ssl);
-  if (ret != 1) {
-    return Status::failure("Failed to complete TLS handshake: " +
-                           std::to_string(ret));
+  const bool handshake_complete = (ret == 1);
+  if (!handshake_complete) {
+    cert_failure = Status::failure("Failed to begin TLS handshake: " +
+                                   std::to_string(ret));
   }
 
   auto delX509 = [](X509* cert) { X509_free(cert); };
   auto cert = std::unique_ptr<X509, decltype(delX509)>(
       SSL_get_peer_certificate(ssl), delX509);
   if (cert == nullptr) {
-    return Status::failure("No certificate");
+    return cert_failure;
   }
 
   Row r;
   r["hostname"] = hostname;
   fillRow(r, cert.get(), dump_certificate, timeout);
+
+  // The negotiated cipher describes the connection rather than the
+  // certificate, and is only meaningful once the handshake has completed.
+  if (handshake_complete) {
+    auto tls_version = SSL_get_version(ssl);
+    if (tls_version != nullptr) {
+      r["tls_version"] = tls_version;
+    }
+
+    auto cipher = SSL_get_current_cipher(ssl);
+    if (cipher != nullptr) {
+      auto cipher_name = SSL_CIPHER_standard_name(cipher);
+      if (cipher_name == nullptr) {
+        cipher_name = SSL_CIPHER_get_name(cipher);
+      }
+
+      if (cipher_name != nullptr) {
+        r["cipher_suite"] = cipher_name;
+      }
+
+      r["cipher_bits"] = INTEGER(SSL_CIPHER_get_bits(cipher, nullptr));
+    }
+  }
+
   results.push_back(r);
   return Status::success();
 }
@@ -438,7 +466,7 @@ QueryData genTLSCertificate(QueryContext& context) {
   }
 
   if (context.hasConstraint("timeout", EQUALS)) {
-    auto timeout =
+    timeout =
         tryTo<int>(*(context.constraints["timeout"].getAll(EQUALS).begin()), 10)
             .takeOr(DEFAULT_READ_TIMEOUT);
     if (timeout < 0) {

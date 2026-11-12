@@ -18,19 +18,53 @@ import templite
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-from osquery_tests.tools.tests import utils
-
 # the log format for the logging module
 LOG_FORMAT = "%(levelname)s [Line %(lineno)d]: %(message)s"
 
 # Read all implementation templates
 TEMPLATES = {}
 
-# Temporary reserved column names
-RESERVED = ["n", "index"]
+# SQLite keywords that cannot be used as bare column identifiers. Most SQLite
+# keywords fall back to being identifiers and are fine as column names; the
+# ones listed here either cause a syntax error (`SELECT * FROM t WHERE commit
+# = 'x'` -> near "commit": syntax error) or silently resolve to a literal
+# instead of the column (`SELECT null FROM t` is the NULL literal, and
+# CURRENT_DATE / CURRENT_TIME / CURRENT_TIMESTAMP are the datetime literals).
+# Derived from the bundled SQLite via sqlite3_keyword_name(): a keyword is
+# reserved if `SELECT <kw> FROM t WHERE <kw> = 'x'` on a table with a column
+# of that name fails to parse or does not return the column's value.
+SQLITE_RESERVED = [
+    "add", "all", "alter", "and", "as", "autoincrement", "between", "case",
+    "cast", "check", "collate", "commit", "constraint", "create",
+    "current_date", "current_time", "current_timestamp", "default",
+    "deferrable", "delete", "distinct", "drop", "else", "escape", "except",
+    "exists", "foreign", "from", "group", "having", "in", "index", "insert",
+    "intersect", "into", "is", "isnull", "join", "limit", "not", "nothing",
+    "notnull", "null", "on", "or", "order", "primary", "raise", "references",
+    "returning", "select", "set", "table", "then", "to", "transaction",
+    "union", "unique", "update", "using", "values", "when", "where",
+]
 
-# Set the platform in osquery-language
-PLATFORM = utils.platform()
+# Column names that cannot be used in a table spec.
+RESERVED = ["n"] + SQLITE_RESERVED
+
+# Existing (table, column) pairs that predate the SQLite keyword check and are
+# kept as-is for backwards compatibility: renaming them would change the
+# result shape of `SELECT *`. Do not add new entries; pick a different name.
+RESERVED_EXCEPTIONS = {
+    ("memory_devices", "set"),
+}
+
+# Set the platform in osquery-language. This is duplicated with
+# tests/utils.py, but that duplication allows usage to _not_ require a
+# build
+def platform():
+    platform = sys.platform
+    if platform.find("linux") == 0:
+        platform = "linux"
+    return platform
+
+PLATFORM = platform()
 
 # Supported SQL types for spec
 class DataType(object):
@@ -67,7 +101,20 @@ COLUMN_OPTIONS = {
     "required": "REQUIRED",
     "optimized": "OPTIMIZED",
     "hidden": "HIDDEN",
+    "collate": "COLLATE",
 }
+
+# Available collation sequences to set on column definitions.
+# This should mimic the collation sequences in ColumnOptions.
+COLLATIONS = [
+    "BINARY",
+    "NOCASE",
+    "RTRIM",
+    "VERSION",
+    "VERSION_ARCH",
+    "VERSION_DPKG",
+    "VERSION_RHEL",
+]
 
 # Column options that render tables uncacheable.
 NON_CACHEABLE = [
@@ -84,26 +131,10 @@ TABLE_ATTRIBUTES = {
     "kernel_required": "KERNEL_REQUIRED", # Deprecated
 }
 
-
-def WINDOWS():
-    return PLATFORM in ['windows', 'win32', 'cygwin']
-
-
-def LINUX():
-    return PLATFORM in ['linux']
-
-
-def POSIX():
-    return PLATFORM in ['linux', 'darwin', 'freebsd']
-
-
-def DARWIN():
-    return PLATFORM in ['darwin']
-
-
-def FREEBSD():
-    return PLATFORM in ['freebsd']
-
+WINDOWS = ['windows', 'win32', 'cygwin']
+LINUX = ['linux']
+POSIX = ['linux', 'darwin']
+DARWIN = ['darwin']
 
 def to_camel_case(snake_case):
     """ convert a snake_case string to camelCase """
@@ -199,6 +230,7 @@ class TableState(Singleton):
         self.description = ""
         self.attributes = {}
         self.examples = []
+        self.notes = ""
         self.aliases = []
         self.fuzz_paths = []
         self.has_options = False
@@ -223,7 +255,17 @@ class TableState(Singleton):
             for option in column.options:
                 # Only allow explicitly-defined options.
                 if option in COLUMN_OPTIONS:
-                    column_options.append("ColumnOptions::" + COLUMN_OPTIONS[option])
+                    if option == "collate":
+                        collation = str(column.options["collate"]).upper()
+                        if collation in COLLATIONS:
+                            column_options.append("ColumnOptions::" + COLUMN_OPTIONS[option] + collation)
+                        else:
+                            print(lightred(
+                                "Table %s column %s contains an unknown collation sequence: %s" % (
+                                self.table_name, column.name, column.options["collate"])))
+                            exit(1)
+                    else:
+                        column_options.append("ColumnOptions::" + COLUMN_OPTIONS[option])
                     all_options.append(COLUMN_OPTIONS[option])
                 else:
                     print(yellow(
@@ -247,12 +289,16 @@ class TableState(Singleton):
             print(lightred("Invalid table spec: %s" % (path)))
             exit(1)
 
-        # Check for reserved column names
+        # Check for reserved column names (and column aliases)
         for column in self.columns():
-            if column.name in RESERVED:
+            for name in [column.name] + list(column.aliases):
+                if name.lower() not in RESERVED:
+                    continue
+                if (self.table_name, name) in RESERVED_EXCEPTIONS:
+                    continue
                 print(lightred(("Cannot use column name: %s in table: %s "
                                 "(the column name is reserved)" % (
-                                    column.name, self.table_name))))
+                                    name, self.table_name))))
                 exit(1)
 
         path_bits = path.split("/")
@@ -305,11 +351,13 @@ class Column(object):
     documentation generation and reference.
     """
 
-    def __init__(self, name, col_type, description="", aliases=[], **kwargs):
+    def __init__(self, name, col_type, description="", aliases=[], platforms=[], notes="", **kwargs):
         self.name = name
         self.type = col_type
         self.description = description
         self.aliases = aliases
+        self.platforms = platforms
+        self.notes = notes
         self.options = kwargs
 
 
@@ -333,6 +381,7 @@ def table_name(name, aliases=[]):
     table.description = ""
     table.attributes = {}
     table.examples = []
+    table.notes = ""
     table.aliases = aliases
 
 
@@ -350,7 +399,7 @@ def schema(schema_list):
     table.schema = schema_list
 
 
-def extended_schema(check, schema_list):
+def extended_schema(platforms, schema_list):
     """
     define a comparator and a list of Columns objects.
     """
@@ -358,7 +407,8 @@ def extended_schema(check, schema_list):
     for it in schema_list:
         if isinstance(it, Column):
             logging.debug("  - column: %s (%s)" % (it.name, it.type))
-            if not check():
+            it.platforms = platforms
+            if not PLATFORM in platforms:
                 it.options['hidden'] = True
             table.schema.append(it)
 
@@ -379,6 +429,8 @@ def select_all(name=None):
 def examples(example_queries):
     table.examples = example_queries
 
+def notes(table_notes):
+    table.notes = table_notes
 
 def attributes(**kwargs):
     for attr in kwargs:

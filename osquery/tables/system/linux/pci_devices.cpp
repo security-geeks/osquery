@@ -34,9 +34,10 @@ const std::string kPCIClassID = "PCI_CLASS";
 const std::string kPCIKeyDriver = "DRIVER";
 const std::string kPCISubsysID = "PCI_SUBSYS_ID";
 
-const std::vector<std::string> kPciidsPathList{"/usr/share/misc/pci.ids",
-                                               "/usr/share/hwdata/pci.ids",
-                                               "/usr/share/pci.ids"};
+extern const std::vector<std::string> kPciidsPathList{
+    "/usr/share/misc/pci.ids",
+    "/usr/share/hwdata/pci.ids",
+    "/usr/share/pci.ids"};
 const std::string kPciidsDeviceClassStartIndicator = "ffff";
 const std::string kPciidsValidHexChars = "0123456789abcdef";
 const char kPciidsCommentChar = '#';
@@ -310,7 +311,7 @@ Status extractVendorModelFromPciDBIfPresent(
   auto status = splitVendorModelAttrs(device_ids_attr, vendor_id, model_id);
   if (!status.ok()) {
     // Legacy behavior of using value "0" being supported for backward
-    // compatability.
+    // compatibility.
     row.emplace("vendor_id", "0");
     row.emplace("model_id", "0");
 

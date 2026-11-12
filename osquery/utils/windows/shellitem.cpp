@@ -147,7 +147,7 @@ ShellFileEntryData fileEntry(const std::string& shell_data) {
   // Path is in unicode, extra 00
   boost::erase_all(shell_name, "00");
 
-  // verify the the hex string length is even. This fixes issues with 10 base
+  // verify the hex string length is even. This fixes issues with 10 base
   // hex values Example 70006900700000... (pip)
   if (shell_name.length() % 2 != 0) {
     shell_name += "0";
@@ -266,6 +266,13 @@ std::string rootFolderItem(const std::string& shell_data) {
 }
 
 std::string driveLetterItem(const std::string& shell_data) {
+  // The volume name occupies six hex characters at offset 6. A truncated
+  // record leaves that field absent, in which case substr() yields an empty
+  // string that unhex() passes through; callers strip the trailing separator
+  // with pop_back(), which is undefined on an empty string.
+  if (shell_data.size() < 12) {
+    return "[UNKNOWN DRIVE VOLUME]";
+  }
   std::string volume;
   try {
     volume = boost::algorithm::unhex(shell_data.substr(6, 6));
@@ -282,7 +289,7 @@ std::string controlPanelCategoryItem(const std::string& shell_data) {
   if (panel_id == "00") {
     return "All Control Panel Items";
   } else if (panel_id == "01") {
-    return "Appearence and Personalization";
+    return "Appearance and Personalization";
   } else if (panel_id == "02") {
     return "Hardware and Sound";
   } else if (panel_id == "03") {
@@ -389,6 +396,12 @@ std::vector<std::string> ftpItem(const std::string& shell_data) {
 }
 
 std::string propertyViewDrive(const std::string& shell_data) {
+  // The drive name occupies six hex characters at offset 26. A truncated
+  // record makes substr() throw or return empty, and callers then strip the
+  // trailing separator with pop_back(), which is undefined on an empty string.
+  if (shell_data.size() < 32) {
+    return "[UNKNOWN USER PROPERTY DRIVE NAME]";
+  }
   std::string drive_hex = shell_data.substr(26, 6);
   std::string name;
   try {

@@ -16,6 +16,7 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <osquery/core/tables.h>
+#include <osquery/utils/darwin/system_profiler.h>
 
 namespace osquery {
 namespace tables {
@@ -84,21 +85,35 @@ BOOL genIopmBatteryInfo(Row& r) {
     return NO;
   }
   if ([batteryInfo objectForKey:@kIOPSHardwareSerialNumberKey]) {
-    r["serial_number"] = TEXT([
-        [batteryInfo objectForKey:@kIOPSHardwareSerialNumberKey] UTF8String]);
+    r["serial_number"] = SQL_TEXT(
+        [[batteryInfo objectForKey:@kIOPSHardwareSerialNumberKey] UTF8String]);
   }
   if ([batteryInfo objectForKey:@kIOPSBatteryHealthKey]) {
-    r["health"] =
-        TEXT([[batteryInfo objectForKey:@kIOPSBatteryHealthKey] UTF8String]);
+    r["health"] = SQL_TEXT(
+        [[batteryInfo objectForKey:@kIOPSBatteryHealthKey] UTF8String]);
+  } else {
+    NSDictionary* __autoreleasing systemProfilerReport = nil;
+    auto status =
+        getSystemProfilerReport("SPPowerDataType", systemProfilerReport);
+    if (status.ok() && systemProfilerReport != nil) {
+      NSArray* items = [systemProfilerReport objectForKey:@"_items"];
+      NSDictionary* powerInfo = [items firstObject];
+      NSDictionary* healthInfo =
+          [powerInfo objectForKey:@"sppower_battery_health_info"];
+      NSString* health = [healthInfo objectForKey:@"sppower_battery_health"];
+      if ([health isKindOfClass:[NSString class]]) {
+        r["health"] = SQL_TEXT([health UTF8String]);
+      }
+    }
   }
   if ([batteryInfo objectForKey:@kIOPSBatteryHealthConditionKey]) {
-    r["condition"] = TEXT([[batteryInfo
+    r["condition"] = SQL_TEXT([[batteryInfo
         objectForKey:@kIOPSBatteryHealthConditionKey] UTF8String]);
   } else {
-    r["condition"] = TEXT("Normal");
+    r["condition"] = SQL_TEXT("Normal");
   }
   if ([batteryInfo objectForKey:@kIOPSPowerSourceStateKey]) {
-    r["state"] = TEXT(
+    r["state"] = SQL_TEXT(
         [[batteryInfo objectForKey:@kIOPSPowerSourceStateKey] UTF8String]);
   }
   if ([batteryInfo objectForKey:@kIOPSIsChargingKey]) {
@@ -111,8 +126,8 @@ BOOL genIopmBatteryInfo(Row& r) {
     r["charged"] = INTEGER(0);
   }
   if ([batteryInfo objectForKey:@kIOPSCurrentCapacityKey]) {
-    r["percent_remaining"] = INTEGER(
-        [[batteryInfo objectForKey:@kIOPSCurrentCapacityKey] intValue]);
+    r["percent_remaining"] =
+        INTEGER([[batteryInfo objectForKey:@kIOPSCurrentCapacityKey] intValue]);
   }
   if ([batteryInfo objectForKey:@kIOPSTimeToEmptyKey]) {
     r["minutes_until_empty"] =
@@ -130,8 +145,14 @@ BOOL genAdvancedBatteryInfo(Row& r) {
   if (advancedBatteryInfo == nullptr) {
     return NO;
   }
+  NSMutableDictionary* batteryData = [advancedBatteryInfo mutableCopy];
+  NSDictionary* nestedBatteryData =
+      [advancedBatteryInfo objectForKey:@"BatteryData"];
+  if ([nestedBatteryData isKindOfClass:[NSDictionary class]]) {
+    [batteryData addEntriesFromDictionary:nestedBatteryData];
+  }
   if ([advancedBatteryInfo objectForKey:@kIOPMPSManufacturerKey]) {
-    r["manufacturer"] = TEXT([[advancedBatteryInfo
+    r["manufacturer"] = SQL_TEXT([[advancedBatteryInfo
         objectForKey:@kIOPMPSManufacturerKey] UTF8String]);
   }
 
@@ -158,32 +179,38 @@ BOOL genAdvancedBatteryInfo(Row& r) {
     r["manufacture_date"] = INTEGER([date timeIntervalSince1970]);
   }
   if ([advancedBatteryInfo objectForKey:@kIOPMDeviceNameKey]) {
-    r["model"] = TEXT(
+    r["model"] = SQL_TEXT(
         [[advancedBatteryInfo objectForKey:@kIOPMDeviceNameKey] UTF8String]);
   }
   if ([advancedBatteryInfo objectForKey:@kIOPMPSCycleCountKey]) {
     r["cycle_count"] = INTEGER(
         [[advancedBatteryInfo objectForKey:@kIOPMPSCycleCountKey] intValue]);
   }
-  if ([advancedBatteryInfo objectForKey:@"DesignCapacity"]) {
-    r["designed_capacity"] = INTEGER(
-        [[advancedBatteryInfo objectForKey:@"DesignCapacity"] intValue]);
+  if ([batteryData objectForKey:@"DesignCapacity"]) {
+    r["designed_capacity"] =
+        INTEGER([[batteryData objectForKey:@"DesignCapacity"] intValue]);
   }
-  if ([advancedBatteryInfo objectForKey:@kIOPMPSMaxCapacityKey]) {
-    r["max_capacity"] = INTEGER(
-        [[advancedBatteryInfo objectForKey:@kIOPMPSMaxCapacityKey] intValue]);
+  if ([batteryData objectForKey:@"AppleRawMaxCapacity"]) {
+    r["max_capacity"] =
+        INTEGER([[batteryData objectForKey:@"AppleRawMaxCapacity"] intValue]);
+  } else if ([batteryData objectForKey:@"FullChargeCapacity"]) {
+    r["max_capacity"] =
+        INTEGER([[batteryData objectForKey:@"FullChargeCapacity"] intValue]);
   }
-  if ([advancedBatteryInfo objectForKey:@kIOPMPSCurrentCapacityKey]) {
-    r["current_capacity"] = INTEGER([[advancedBatteryInfo
-        objectForKey:@kIOPMPSCurrentCapacityKey] intValue]);
+  if ([batteryData objectForKey:@"AppleRawCurrentCapacity"]) {
+    r["current_capacity"] = INTEGER(
+        [[batteryData objectForKey:@"AppleRawCurrentCapacity"] intValue]);
+  } else if ([batteryData objectForKey:@"RemainingCapacity"]) {
+    r["current_capacity"] =
+        INTEGER([[batteryData objectForKey:@"RemainingCapacity"] intValue]);
   }
   if ([advancedBatteryInfo objectForKey:@kIOPMPSAmperageKey]) {
     r["amperage"] = INTEGER(
         [[advancedBatteryInfo objectForKey:@kIOPMPSAmperageKey] intValue]);
   }
   if ([advancedBatteryInfo objectForKey:@kIOPSVoltageKey]) {
-    r["voltage"] = INTEGER(
-        [[advancedBatteryInfo objectForKey:@kIOPSVoltageKey] intValue]);
+    r["voltage"] =
+        INTEGER([[advancedBatteryInfo objectForKey:@kIOPSVoltageKey] intValue]);
   }
   return YES;
 }
@@ -192,7 +219,7 @@ QueryData genBatteryInfo(QueryContext& context) {
   QueryData results;
   Row row;
   @autoreleasepool {
-    if (genIopmBatteryInfo(row)){
+    if (genIopmBatteryInfo(row)) {
       genAdvancedBatteryInfo(row);
       results.push_back(row);
     }

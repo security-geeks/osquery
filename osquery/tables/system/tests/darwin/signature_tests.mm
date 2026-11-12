@@ -18,6 +18,7 @@
 #include <boost/make_unique.hpp>
 
 #include "osquery/tests/test_util.h"
+#include <osquery/config/tests/test_utils.h>
 
 namespace fs = boost::filesystem;
 
@@ -26,28 +27,26 @@ namespace tables {
 
 void genSignatureForFile(const std::string& path,
                          bool hashResources,
+                         bool hashExecutable,
                          QueryData& results);
 
-// Gets the full path to the current executable (only works on Darwin)
-std::string getExecutablePath() {
-  uint32_t size = 1024;
-
-  while (true) {
-    auto buf = boost::make_unique<char[]>(size);
-
-    if (_NSGetExecutablePath(buf.get(), &size) == 0) {
-      return std::string(buf.get());
-    }
-
-    // If we get here, the buffer wasn't large enough, and we need to
-    // reallocate.  We just continue the loop and will reallocate above.
-  }
+// Get the full, real path to the unsigned test executable (only works on
+// Darwin).
+std::string getUnsignedExecutablePath() {
+  return (getTestConfigDirectory() / "unsigned_test").string();
 }
 
-// Get the full, real path to the current executable (only works on Darwin).
-std::string getRealExecutablePath() {
-  auto path = getExecutablePath();
-  return fs::canonical(path).string();
+// macOS 26 (Tahoe) renamed the code-signing authority for Apple's system
+// binaries from "Software Signing" to "macOS Software Signing". Accept either
+// so the test is valid across the macOS versions we build and test on.
+::testing::AssertionResult IsAppleSoftwareSigningAuthority(
+    const std::string& authority) {
+  if (authority == "Software Signing" ||
+      authority == "macOS Software Signing") {
+    return ::testing::AssertionSuccess();
+  }
+  return ::testing::AssertionFailure()
+         << "unexpected code-signing authority: '" << authority << "'";
 }
 
 class SignatureTest : public testing::Test {
@@ -73,30 +72,33 @@ class SignatureTest : public testing::Test {
 TEST_F(SignatureTest, test_get_valid_signature) {
   std::string path = "/bin/ls";
 
-  Row expected = {{"path", path},
-                  {"signed", "1"},
-                  {"identifier", "com.apple.ls"},
-                  {"authority", "Software Signing"}};
+  Row expected = {
+      {"path", path}, {"signed", "1"}, {"identifier", "com.apple.ls"}};
 
   for (bool hash_resources : {true, false}) {
-    QueryData results;
-    genSignatureForFile(path, hash_resources, results);
+    for (bool hash_executable : {true, false}) {
+      QueryData results;
+      genSignatureForFile(path, hash_resources, hash_executable, results);
 
-    const auto& first_row = results.front();
+      const auto& first_row = results.front();
 
-    for (const auto& column : expected) {
-      const auto& actual_value = first_row.at(column.first);
-      const auto& expected_value = column.second;
+      for (const auto& column : expected) {
+        const auto& actual_value = first_row.at(column.first);
+        const auto& expected_value = column.second;
 
-      EXPECT_EQ(expected_value, actual_value)
-          << " for column named " << column.first;
+        EXPECT_EQ(expected_value, actual_value)
+            << " for column named " << column.first;
+      }
+
+      EXPECT_TRUE(IsAppleSoftwareSigningAuthority(first_row.at("authority")));
+
+      EXPECT_EQ(first_row.at("hash_resources"), INTEGER(hash_resources));
+      EXPECT_EQ(first_row.at("hash_executable"), INTEGER(hash_executable));
+
+      // Could check the team identifier but it is flaky on some distros.
+      // ASSERT_TRUE(results.front()["team_identifier"].length() > 0);
+      ASSERT_TRUE(first_row.at("cdhash").length() > 0);
     }
-
-    EXPECT_EQ(first_row.at("hash_resources"), INTEGER(hash_resources));
-
-    // Could check the team identifier but it is flaky on some distros.
-    // ASSERT_TRUE(results.front()["team_identifier"].length() > 0);
-    ASSERT_TRUE(first_row.at("cdhash").length() > 0);
   }
 }
 
@@ -107,13 +109,14 @@ TEST_F(SignatureTest, test_get_valid_signature) {
  * relying on a particular binary to be present.
  */
 TEST_F(SignatureTest, test_get_unsigned) {
-  std::string path = getRealExecutablePath();
+  std::string path = getUnsignedExecutablePath();
 
   QueryData results;
-  genSignatureForFile(path, true, results);
+  genSignatureForFile(path, true, true, results);
 
   Row expected = {{"path", path},
                   {"hash_resources", "1"},
+                  {"hash_executable", "1"},
                   {"signed", "0"},
                   {"identifier", ""},
                   {"cdhash", ""},
@@ -125,13 +128,51 @@ TEST_F(SignatureTest, test_get_unsigned) {
   }
 }
 
+/**
+ * Invalidate a universal binary's signature by modifying one byte in each
+ * architecture section.
+ */
+void invalidateUniversalBinarySignature(std::vector<uint8_t>& binary) {
+  uint32_t sliceCount;
+  uint32_t offset;
+  uint32_t sliceSize;
+
+  // offset 4 = uint32 number of architecture slices
+  sliceCount = CFSwapInt32BigToHost(*(uint32_t*)&binary[4]);
+
+  // offset 8 = uint32 start of first slice header
+  uint32_t sliceHeader = 8;
+  for (uint32_t i = 0; i < sliceCount; ++i) {
+    // slice header offset 8 = offset to slice data
+    offset = CFSwapInt32BigToHost(*(uint32_t*)&binary[sliceHeader + 8]);
+    // slice header offset 12 = size of slice data, in bytes
+    sliceSize = CFSwapInt32BigToHost(*(uint32_t*)&binary[sliceHeader + 12]);
+
+    // slice headers are 20 bytes in length, go to the next slice header
+    sliceHeader += 20;
+    if (offset && sliceSize) {
+      // Modify the middle most byte in the architecture slice
+      uint32_t target = offset + (sliceSize / 2);
+      binary[target] = ~binary[target];
+    }
+  }
+}
+
+/**
+ * Invalidate a Mach-O binary by modifying one byte in the middle of the file.
+ */
+void invalidateMachOBinarySignature(std::vector<uint8_t>& binary) {
+  uint32_t offset = binary.size() / 2;
+  binary[offset] = ~binary[offset];
+}
+
 /*
  * Ensures that the results for a signed but invalid binary are correct.
  *
  * This test is a bit of a hack - we copy an existing signed binary (/bin/ls,
- * like above), and then modify one byte in the middle of the file by XORing it
- * with 0xBA.  This should ensure that it differs from whatever the original
- * byte was, and should thus invalidate the signature.
+ * like above), and then modify one byte in each architecture slice. This should
+ * ensure that it differs from whatever the original byte was, and should thus
+ * invalidate the signature for the slice.
  */
 TEST_F(SignatureTest, test_get_invalid_signature) {
   std::string originalPath = "/bin/ls";
@@ -151,9 +192,12 @@ TEST_F(SignatureTest, test_get_invalid_signature) {
   fclose(f);
   ASSERT_EQ(nread, binary.size());
 
-  // Actually modify a byte.
-  size_t offset = binary.size() / 2;
-  binary[offset] = binary[offset] ^ 0xBA;
+  uint32_t magic = *(uint32_t*)&binary[0];
+  if (magic == 0xCAFEBABE || magic == 0xBEBAFECA) {
+    invalidateUniversalBinarySignature(binary);
+  } else {
+    invalidateMachOBinarySignature(binary);
+  }
 
   // Write it back to a file.
   f = fopen(newPath.c_str(), "wb");
@@ -163,19 +207,38 @@ TEST_F(SignatureTest, test_get_invalid_signature) {
 
   // Get the signature of this new file.
   QueryData results;
-  genSignatureForFile(newPath, true, results);
+  genSignatureForFile(newPath, true, true, results);
 
   Row expected = {{"path", newPath},
                   {"hash_resources", "1"},
+                  {"hash_executable", "1"},
                   {"signed", "0"},
-                  {"identifier", "com.apple.ls"},
-                  {"authority", "Software Signing"}};
+                  {"identifier", "com.apple.ls"}};
 
   for (const auto& column : expected) {
     EXPECT_EQ(results.front()[column.first], column.second);
   }
+  EXPECT_TRUE(IsAppleSoftwareSigningAuthority(results.front()["authority"]));
   ASSERT_TRUE(results.front().count("team_identifier") > 0);
   ASSERT_TRUE(results.front()["cdhash"].length() > 0);
+
+  // Now requesting a signature should return signed = 1 even if the
+  // executable was modified because we are setting hash_executable=0.
+  QueryData results2;
+  genSignatureForFile(newPath, false, false, results2);
+
+  Row expected2 = {{"path", newPath},
+                   {"hash_resources", "0"},
+                   {"hash_executable", "0"},
+                   {"signed", "1"},
+                   {"identifier", "com.apple.ls"}};
+
+  for (const auto& column : expected2) {
+    EXPECT_EQ(results2.front()[column.first], column.second);
+  }
+  EXPECT_TRUE(IsAppleSoftwareSigningAuthority(results2.front()["authority"]));
+  ASSERT_TRUE(results2.front().count("team_identifier") > 0);
+  ASSERT_TRUE(results2.front()["cdhash"].length() > 0);
 }
 }
 }

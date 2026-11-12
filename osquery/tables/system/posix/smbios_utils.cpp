@@ -10,6 +10,7 @@
 #include <iomanip>
 
 #include <boost/algorithm/string/trim.hpp>
+#include <boost/thread/thread.hpp>
 
 #include <osquery/hashing/hashing.h>
 #include <osquery/tables/system/smbios_utils.h>
@@ -17,6 +18,7 @@
 namespace osquery {
 namespace tables {
 
+// All the kSMBIOS* mappings have been taken from the SMBIOS spec PDF
 const std::map<uint8_t, std::string> kSMBIOSTypeDescriptions = {
     {0, "BIOS Information"},
     {1, "System Information"},
@@ -186,6 +188,9 @@ const std::map<uint8_t, std::string> kSMBIOSMemoryErrorOperationTable = {
     {0x04, "Write"},
     {0x05, "Partial write"},
 };
+
+const std::map<std::string, std::string> kSMBIOSProcessorTypeFriendlyName = {
+    {"3", "CPU"}, {"4", "MATH"}, {"5", "DSP"}, {"6", "GPU"}};
 
 template <class T>
 static inline std::string toHexStr(T num, int width = 4) {
@@ -575,6 +580,44 @@ void genSMBIOSOEMStrings(const SMBStructHeader* hdr,
                              {"number", INTEGER(static_cast<int>(i))},
                              {"value", dmiString(textAddrs, i, maxlen)}});
   }
+}
+
+void genSMBIOSProcessor(size_t index,
+                        const SMBStructHeader* hdr,
+                        uint8_t* address,
+                        uint8_t* textAddrs,
+                        size_t size,
+                        QueryData& results) {
+  const size_t maxOffset = 0x2e + 2;
+  if (hdr->type != kSMBIOSTypeProcessor || size < maxOffset) {
+    return;
+  }
+
+  Row r;
+  auto maxlen = size - hdr->length;
+  r["socket_designation"] = dmiString(textAddrs, address[0x04], maxlen);
+  r["model"] = dmiString(textAddrs, address[0x10], maxlen);
+  r["manufacturer"] = dmiString(textAddrs, address[0x07], maxlen);
+  r["processor_type"] = INTEGER(static_cast<int>(address[0x05]));
+  r["cpu_status"] = INTEGER(static_cast<int>(address[0x18]));
+  r["current_clock_speed"] = std::to_string(dmiToWord(address, 0x16));
+  r["max_clock_speed"] = std::to_string(dmiToWord(address, 0x14));
+
+  // Check for new fields added on SMBIOS 2.5, falling back to runtime
+  // detection on older versions. Note that runtime values can change during
+  // execution, so the fallback is "almost" accurate.
+  if (hdr->length >= 0x28) {
+    r["number_of_cores"] = INTEGER(static_cast<int>(address[0x23]));
+    r["logical_processors"] = INTEGER(static_cast<int>(address[0x25]));
+    uint16_t processorChar = dmiToWord(address, 0x26);
+    r["address_width"] = (processorChar & (1 << 2)) != 0 ? "64" : "32";
+  } else {
+    r["number_of_cores"] = INTEGER(boost::thread::physical_concurrency());
+    r["logical_processors"] = INTEGER(boost::thread::hardware_concurrency());
+    r["address_width"] = (sizeof(void*) == 8) ? "64" : "32";
+  }
+
+  results.push_back(r);
 }
 
 std::string dmiString(uint8_t* data, uint8_t index, size_t maxlen) {

@@ -8,6 +8,8 @@
  */
 
 #include <mach/mach.h>
+#include <sys/sysctl.h>
+#include <vector>
 
 #include <IOKit/IOKitLib.h>
 #include <SystemConfiguration/SystemConfiguration.h>
@@ -23,6 +25,27 @@
 
 namespace osquery {
 namespace tables {
+
+/**
+ * Get a string from a sysctl name.
+ *
+ * @param name sysctl property name
+ */
+std::string getSysctlString(const std::string& name) {
+  size_t len = 0;
+  sysctlbyname(name.c_str(), nullptr, &len, nullptr, 0);
+
+  if (len == 0) {
+    return {};
+  }
+
+  std::vector<char> value(len);
+  if (sysctlbyname(name.c_str(), value.data(), &len, nullptr, 0) != 0) {
+    return {};
+  }
+
+  return std::string(value.data(), len - 1);
+}
 
 static inline void genHostInfo(Row& r) {
   auto host = mach_host_self();
@@ -66,7 +89,7 @@ static inline void genHardwareInfo(Row& r) {
 
   r["hardware_version"] = getIOKitProperty(properties, "version");
   r["hardware_vendor"] = getIOKitProperty(properties, "manufacturer");
-  r["hardware_model"] = getIOKitProperty(properties, "product-name");
+  r["hardware_model"] = getIOKitProperty(properties, "model");
   r["hardware_serial"] = getIOKitProperty(properties, "IOPlatformSerialNumber");
 
   // version, manufacturer, and product-name have a trailing space
@@ -107,17 +130,12 @@ QueryData genSystemInfo(QueryContext& context) {
   genHostInfo(r);
   genHardwareInfo(r);
 
-  // The CPU brand string also exists in system_controls.
-  auto qd = SQL::selectAllFrom("cpuid");
-  for (const auto& row : qd) {
-    if (row.at("feature") == "product_name") {
-      r["cpu_brand"] = row.at("value");
-      boost::trim(r["cpu_brand"]);
-    }
-  }
+  // The CPU brand string.
+  r["cpu_brand"] = getSysctlString("machdep.cpu.brand_string");
+  boost::trim(r["cpu_brand"]);
 
   results.push_back(r);
   return results;
 }
-}
-}
+} // namespace tables
+} // namespace osquery

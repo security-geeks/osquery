@@ -9,19 +9,21 @@
 
 #include <gtest/gtest.h>
 
+#include <osquery/config/config.h>
+#include <osquery/core/shutdown.h>
 #include <osquery/core/system.h>
 #include <osquery/database/database.h>
+#include <osquery/dispatcher/dispatcher.h>
+#include <osquery/dispatcher/scheduler.h>
 #include <osquery/logger/logger.h>
 #include <osquery/registry/registry.h>
-
-#include <osquery/config/config.h>
-#include <osquery/dispatcher/scheduler.h>
 #include <osquery/sql/sqlite_util.h>
 #include <osquery/utils/system/time.h>
 
 namespace osquery {
 
 DECLARE_bool(disable_logging);
+DECLARE_bool(enable_numeric_monitoring);
 DECLARE_uint64(schedule_reload);
 
 class SchedulerTests : public testing::Test {
@@ -38,6 +40,7 @@ class SchedulerTests : public testing::Test {
   void TearDown() override {
     FLAGS_disable_logging = logging_;
     Config::get().reset();
+    resetShutdown();
   }
 
  private:
@@ -68,6 +71,7 @@ TEST_F(SchedulerTests, test_monitor) {
   // There is no pack for this query within the config, that is fine as these
   // performance stats are tracked independently.
   EXPECT_EQ(perf.executions, 1U);
+  EXPECT_GT(perf.output_size, 0U);
 
   // A bit more testing, potentially redundant, check the database results.
   // Since we are only monitoring, no 'actual' results are stored.
@@ -81,6 +85,74 @@ TEST_F(SchedulerTests, test_monitor) {
   EXPECT_FALSE(timestamp.empty());
 }
 
+// Numeric monitoring profiles a query in addition to, not instead of, recording
+// its performance, which osquery_schedule reports.
+TEST_F(SchedulerTests, test_monitor_with_numeric_monitoring) {
+  const auto numeric_monitoring = FLAGS_enable_numeric_monitoring;
+  FLAGS_enable_numeric_monitoring = true;
+
+  std::string name = "pack_test_numeric_monitoring_query";
+  ScheduledQuery query("test", "test", "select 1 as number");
+  query.interval = 10;
+  query.splayed_interval = 11;
+
+  auto results = monitor(name, query);
+  EXPECT_EQ(results.rowsTyped().size(), 1U);
+  results = monitor(name, query);
+  EXPECT_EQ(results.rowsTyped().size(), 1U);
+
+  QueryPerformance perf;
+  Config::get().getPerformanceStats(
+      name, ([&perf](const QueryPerformance& r) { perf = r; }));
+  EXPECT_EQ(perf.executions, 2U);
+  EXPECT_GT(perf.last_executed, 0U);
+  EXPECT_EQ(perf.output_size, 28U);
+
+  // The execution is recorded too, as without numeric monitoring.
+  std::string timestamp;
+  getDatabaseValue(kPersistentSettings, "timestamp." + name, timestamp);
+  EXPECT_FALSE(timestamp.empty());
+
+  FLAGS_enable_numeric_monitoring = numeric_monitoring;
+
+  // Recording numeric monitoring points starts a flusher service; stop it so
+  // the test does not leave a running thread behind. Stopping services leaves
+  // the dispatcher refusing new services until it is reset.
+  Dispatcher::stopServices();
+  Dispatcher::joinServices();
+  Dispatcher::instance().resetStopping();
+}
+
+TEST_F(SchedulerTests, test_output_size) {
+  // set up the test query
+  auto query_name = "output_size_test_query";
+  ScheduledQuery query("test", "test", "select 1 as number");
+  query.interval = 1;
+  query.splayed_interval = 0;
+
+  auto results = monitor(query_name, query);
+  EXPECT_EQ(results.rowsTyped().size(), 1U);
+
+  QueryPerformance perf;
+  Config::get().getPerformanceStats(
+      query_name, ([&perf](const QueryPerformance& r) { perf = r; }));
+  // Total execution should be just 1
+  EXPECT_EQ(perf.executions, 1U);
+  // The output size is 6 for "number", and 8 for the number, so 14 total
+  EXPECT_EQ(perf.output_size, 14U);
+
+  // run the query again
+  results = monitor(query_name, query);
+  EXPECT_EQ(results.rowsTyped().size(), 1U);
+
+  Config::get().getPerformanceStats(
+      query_name, ([&perf](const QueryPerformance& r) { perf = r; }));
+
+  // this time check that executions and output_size are doubled
+  EXPECT_EQ(perf.executions, 2U);
+  EXPECT_EQ(perf.output_size, 28U);
+}
+
 TEST_F(SchedulerTests, test_config_results_purge) {
   // Set a query time for now (time is only important relative to a week ago).
   auto query_time = osquery::getUnixTime();
@@ -90,6 +162,8 @@ TEST_F(SchedulerTests, test_config_results_purge) {
   setDatabaseValue(kPersistentSettings, "interval.test_query", "11");
   // Store meaningless query differential results.
   setDatabaseValue(kQueries, "test_query", "{}");
+  setDatabaseValue(kQueries, "test_querycounter", "1");
+  setDatabaseValue(kQueries, "query.test_query", "SELECT * FROM TIME");
 
   // We do not need "THE" config instance.
   // We only need to trigger a 'purge' event, this occurs when configuration
@@ -115,8 +189,23 @@ TEST_F(SchedulerTests, test_config_results_purge) {
     EXPECT_FALSE(content.empty());
   }
 
+  // Reserved keys should not have a set timestamp
+  {
+    std::string content;
+    getDatabaseValue(
+        kPersistentSettings, "timestamp.test_querycounter", content);
+    EXPECT_TRUE(content.empty());
+  }
+
+  {
+    std::string content;
+    getDatabaseValue(
+        kPersistentSettings, "timestamp.query.test_query", content);
+    EXPECT_TRUE(content.empty());
+  }
+
   // Update the timestamp to have run a week and a day ago.
-  query_time -= (84600 * (7 + 1));
+  query_time -= (86400 * (7 + 1));
   setDatabaseValue(
       kPersistentSettings, "timestamp.test_query", std::to_string(query_time));
 
@@ -232,7 +321,8 @@ TEST_F(SchedulerTests, test_scheduler_drift_accumulation) {
           "6": {"query": "select 6 as number", "interval": 1},
           "7": {"query": "select 7 as number", "interval": 1},
           "8": {"query": "select 1 as number", "interval": 1},
-          "9": {"query": "select 2 as number", "interval": 1}
+          "9": {"query": "select 2 as number", "interval": 1},
+          "10": {"query": "select sleep(1)", "interval": 1}
         }
       }
     }
@@ -263,4 +353,4 @@ TEST_F(SchedulerTests, test_scheduler_reload) {
   SchedulerRunner runner(expire, 1);
   FLAGS_schedule_reload = backup_reload;
 }
-}
+} // namespace osquery

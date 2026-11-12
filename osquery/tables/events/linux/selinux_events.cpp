@@ -18,10 +18,7 @@
 #include <osquery/utils/system/uptime.h>
 
 namespace osquery {
-FLAG(bool,
-     audit_allow_selinux_events,
-     false,
-     "Allow the audit publisher to process audit events");
+DECLARE_bool(audit_allow_selinux_events);
 
 REGISTER(SELinuxEventSubscriber, "event_subscriber", "selinux_events");
 
@@ -43,9 +40,7 @@ Status SELinuxEventSubscriber::Callback(const ECRef& ec, const SCRef& sc) {
     return status;
   }
 
-  for (auto& row : emitted_row_list) {
-    add(row);
-  }
+  addBatch(emitted_row_list);
 
   return Status::success();
 }

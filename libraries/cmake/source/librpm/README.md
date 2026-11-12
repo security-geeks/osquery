@@ -2,62 +2,98 @@
 
 ## Linux
 
-Using Ubuntu 14.04 (glibc 2.12)
+You will need to build the following osquery targets first: thirdparty_popt, thirdparty_libmagic, thirdparty_lzma, thirdparty_sqlite, thirdparty_zlib, thirdparty_zstd, openssl.
 
-```sh
-ldd --version
-ldd (GNU libc) 2.12.2
+Then create the following symlinks for each library, excluded openssl, from the root of the build folder:
+
+```
+ln -s libthirdparty_popt.a libs/src/popt/libpopt.a
+ln -s libthirdparty_libmagic.a libs/src/libmagic/libmagic.a
+ln -s libthirdparty_lzma.a libs/src/lzma/liblzma.a
+ln -s libthirdparty_sqlite.a libs/src/sqlite/libsqlite.a
+ln -s libthirdparty_zlib.a libs/src/zlib/libz.a
+ln -s libthirdparty_zstd.a libs/src/zstd/libzstd.a
 ```
 
-This is generally difficult to install.
 
-You will need to install:
+Then:
+1. Copy the build folder to the target machine and point the `LIBS_BUILD` env var to it
+2. Clone the latest version of osquery to the target machine and point the `LIBS_SRC` env var to it
+3. Copy the patches under `libraries/cmake/source/librpm/build-patches` and `libraries/cmake/source/librpm/patches` to the target machine
+4. Move inside the librpm source code and apply with `git apply` the patches
 
-```sh
-sudo apt-get install libmagic-dev libpopt-dev autopoint zlib1g-dev
-```
-
-And you will need a "built" version of osquery in `./build` to find/use our exact OpenSSL version.
-
-Generated with the following commands:
+Then run the following commands:
 
 ```sh
-export OPENSSL_INCLUDE=../../../../../build/openssl/openssl-prefix/src/openssl/include
-export OPENSSL_LINK=../../../../../build/openssl/openssl-prefix/src/openssl
-export LIBMAGIC_INCLUDE=../../libmagic/include
-export LIBMAGIC_LINK=/usr/lib/x86_64-linux-gnu
-export POPT_INCLUDE=../../popt/src
-export POPT_LINK=/usr/lib/x86_64-linux-gnu
-export PATH=/usr/local/osquery-toolchain/usr/bin:$PATH
-export CFLAGS="--sysroot /usr/local/osquery-toolchain -I$OPENSSL_INCLUDE -I$LIBMAGIC_INCLUDE -I$POPT_INCLUDE"
+export TOOLCHAIN=/usr/local/osquery-toolchain
+export PKG_CONFIG_LIBDIR=${TOOLCHAIN}/usr/lib/pkgconfig
+export PKG_CONFIG_PATH=
+export PKG_CONFIG_SYSROOT_DIR=${TOOLCHAIN}
+export OPENSSL_INCLUDE="${LIBS_BUILD}/openssl/openssl-prefix/src/openssl/include"
+export OPENSSL_LINK="${LIBS_BUILD}/openssl/openssl-prefix/src/openssl"
+export LIBMAGIC_INCLUDE="${LIBS_SRC}/libraries/cmake/source/libmagic/include"
+export LIBMAGIC_LINK="${LIBS_BUILD}/libs/src/libmagic"
+export POPT_INCLUDE="${LIBS_SRC}/libraries/cmake/source/popt/src/src"
+export POPT_LINK="${LIBS_BUILD}/libs/src/popt"
+export ZLIB_INCLUDE="${LIBS_SRC}/libraries/cmake/source/zlib/src"
+export ZLIB_LINK="${LIBS_BUILD}/libs/src/zlib"
+export LZMA_INCLUDE="${LIBS_SRC}/libraries/cmake/source/lzma/src/src/liblzma/api"
+export LZMA_LINK="${LIBS_BUILD}/libs/src/lzma"
+export SQLITE_LIBS="-L${LIBS_BUILD}/libs/src/sqlite -lsqlite"
+export SQLITE_CFLAGS="-I${LIBS_SRC}/libraries/cmake/source/sqlite/src/src"
+export ZSTD_LIBS="-L${LIBS_BUILD}/libs/src/zstd -lzstd"
+export ZSTD_CFLAGS="-I${LIBS_SRC}/libraries/cmake/source/zstd/src/lib"
+export CFLAGS="--sysroot ${TOOLCHAIN} -I${OPENSSL_INCLUDE} -I${LIBMAGIC_INCLUDE} -I${POPT_INCLUDE} -I${ZLIB_INCLUDE} -I${LZMA_INCLUDE}"
 export CPPFLAGS="${CFLAGS}"
-export CXXFLAGS="${CFLAGS}"
-export LDFLAGS="${CFLAGS} -L$OPENSSL_LINK -L$LIBMAGIC_LINK -L$POPT_LINK"
-export CC=clang
+export LDFLAGS="${CFLAGS} -L${OPENSSL_LINK} -L${LIBMAGIC_LINK} -L${POPT_LINK} -L${ZLIB_LINK} -L${LZMA_LINK}"
+export CC=${TOOLCHAIN}/usr/bin/clang
+export LIBS="-llzma -lz -lrt"
 
-./autogen.sh
-./configure --enable-static --with-crypto=openssl --without-archive --enable-bdb --enable-bdb-ro --enable_sqlite --without-lua --disable-plugins --disable-openmp
+autoreconf -i
+./configure \
+  --enable-static \
+  --disable-shared \
+  --with-crypto=openssl \
+  --without-archive \
+  --enable-bdb-ro \
+  --enable-sqlite \
+  --enable-ndb \
+  --disable-plugins \
+  --disable-openmp \
+  --disable-libelf \
+  --without-acl \
+  --without-imaevm \
+  --without-selinux \
+  --without-fsverity \
+  --without-fapolicyd \
+  --without-audit \
+  --without-cap \
+  --without-readline
 ```
 
-Then copy
+Then copy these files to the osquery source
 
-```sh
-cp ./config.h ../config/config.h
-cp ./lib/rpmhash.C ../generated/lib/
-```
+`./config.h` -> `config/<arch>/config.h`
+`./lib/rpmhash.C` -> `/generated/<arch>/lib/`
 
-Run `make` and then copy the include files:
+Run `make` and then copy this additional generated file:
 
-```sh
-cp -R ./include ../
-cp ./lib/tagtbl.C ../generated/lib/
-```
+`./lib/tagtbl.C` -> `generated/<arch>/lib/`
 
-And set (in the appropriate places):
+## Linux x86_64
 
-```sh
-#define HAVE_LZMA_H 1
-#define HAVE_ZSTD 1
-```
+Make sure that the `config.h` file does not have defined `HAVE_SECURE_GETENV`, `HAVE_GETAUXVAL`, and `HAVE_SYNCFS`.
 
-Make sure `secure_getenv`, `getauxval`, and `syncfs` are not found.
+### Additional Notes
+
+The build time patch is required to have the configure.ac script work with the version of GETTEXT it's present on CentOS 6.
+Furthermore, librpm has removed the ability to disable the use of Lua, which is not useful for osquery, since we only want to read, so we have to patch it out.
+
+Finally there are two additional patches which are instead applied when we build osquery.
+One, the `remove-lua.patch`, which only touches source code, is a part of the bigger build patch. So when having to update this first generate the build patch, then remove the parts from it that touch build files and the result is this patch.
+
+To regenerate the `centos6-support-and-remove-lua.patch`, make all the necessary changes to the build files and then use `git diff -- '*.ac' '*.am'`.
+To regenerate the `remove-lua.patch` make all the necessary changes to the source code to remove lua and then use `git diff -- '*.c' '*.h'`.
+To regenerate the `open-only-pkgs.patch`, the idea is to only open the Packages database, which in the current version can be done by setting the `justPkgs` to 1.
+
+The `disable-shell-macros.patch` disables librpm's `%(...)` shell command macro expansion in `rpmio/macro.c`. osquery parses RPM configuration, macros and databases that can come from an untrusted source (for example a container queried through the `pid_with_namespace` column), and expanding a shell macro from such a source would run an arbitrary command with osquery's privileges. osquery only reads package metadata, so the expansion is made a no-op: a `%(...)` macro expands to nothing, librpm logs a warning, and the rest of the string is expanded as usual. The patch must be generated against the unpatched source, because it is applied first (patches are applied in alphabetical order). To regenerate it, change `doShellEscape` to stop calling `popen` and then use `git diff -- rpmio/macro.c`. The `RpmTests.test_shell_macros_*` tests check that a shell macro does not run and that the surrounding text is kept.

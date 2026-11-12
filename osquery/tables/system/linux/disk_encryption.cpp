@@ -7,56 +7,46 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
-#include <unistd.h>
-
-#include <vector>
-
 #include <osquery/core/core.h>
 #include <osquery/core/tables.h>
 #include <osquery/logger/logger.h>
-#include <osquery/sql/sql.h>
+#include <osquery/tables/system/posix/disk_encryption.h>
 #include <osquery/utils/conversions/join.h>
+#include <osquery/utils/linux/block_device_enumeration.h>
 
 extern "C" {
 #include <libcryptsetup.h>
 }
 
-// FIXME: Add enum generation for tables and remove following code
-// Copy of values in disk_encryption.mm
-const std::string kEncryptionStatusEncrypted = "encrypted";
-const std::string kEncryptionStatusUndefined = "undefined";
-const std::string kEncryptionStatusNotEncrypted = "not encrypted";
-
 namespace osquery {
 namespace tables {
-
-void genFDEStatusForBlockDevice(const std::string& name,
-                                const std::string& uuid,
-                                const std::string& parent_name,
-                                std::map<std::string, Row>& encrypted_rows,
-                                QueryData& results) {
+void genFDEStatusForBlockDevice(const BlockDevice& block_device,
+                                std::set<BlockDevice>& block_devices,
+                                std::map<std::string, Row>& encryption_status) {
   Row r;
-  r["name"] = name;
-  r["uuid"] = uuid;
+  r["name"] = block_device.name;
+  r["uuid"] = block_device.uuid;
 
   struct crypt_device* cd = nullptr;
-  auto ci = crypt_status(cd, name.c_str());
+  auto ci = crypt_status(cd, block_device.name.c_str());
 
   switch (ci) {
   case CRYPT_ACTIVE:
   case CRYPT_BUSY: {
     r["encrypted"] = "1";
     r["encryption_status"] = kEncryptionStatusEncrypted;
+    r["type"] = "";
 
-    auto crypt_init = crypt_init_by_name_and_header(&cd, name.c_str(), nullptr);
+    auto crypt_init =
+        crypt_init_by_name_and_header(&cd, block_device.name.c_str(), nullptr);
     if (crypt_init < 0) {
-      VLOG(1) << "Unable to initialize crypt device for " << name;
+      VLOG(1) << "Unable to initialize crypt device for " << block_device.name;
       break;
     }
 
     struct crypt_active_device cad;
-    if (crypt_get_active_device(cd, name.c_str(), &cad) < 0) {
-      VLOG(1) << "Unable to get active device for " << name;
+    if (crypt_get_active_device(cd, block_device.name.c_str(), &cad) < 0) {
+      VLOG(1) << "Unable to get active device for " << block_device.name;
       break;
     }
 
@@ -79,26 +69,35 @@ void genFDEStatusForBlockDevice(const std::string& name,
     }
 
     r["type"] = osquery::join(items, "-");
-    encrypted_rows[name] = r;
     break;
   }
-
   default:
-    if (encrypted_rows.count(parent_name)) {
-      auto parent_row = encrypted_rows[parent_name];
-      r["encryption_status"] = kEncryptionStatusEncrypted;
-      r["encrypted"] = "1";
+    r["encryption_status"] = kEncryptionStatusNotEncrypted;
+    r["encrypted"] = "0";
+    r["type"] = "";
+
+    // Set crypt status from parent block device.
+    if (!block_device.parent.empty()) {
+      // Since `genFDEStatusForBlockDevice` is recursive, ensure no duplicates.
+      if (!encryption_status.count(block_device.parent)) {
+        if (auto parent = block_devices.find(block_device.parent);
+            parent != block_devices.end()) {
+          genFDEStatusForBlockDevice(*parent, block_devices, encryption_status);
+        }
+      }
+
+      auto parent_row = encryption_status[block_device.parent];
+      r["encryption_status"] = parent_row["encryption_status"];
+      r["encrypted"] = parent_row["encrypted"];
       r["type"] = parent_row["type"];
-    } else {
-      r["encryption_status"] = kEncryptionStatusNotEncrypted;
-      r["encrypted"] = "0";
     }
   }
 
   if (cd != nullptr) {
     crypt_free(cd);
   }
-  results.push_back(r);
+
+  encryption_status[r["name"]] = r;
 }
 
 QueryData genFDEStatus(QueryContext& context) {
@@ -109,16 +108,21 @@ QueryData genFDEStatus(QueryContext& context) {
     return results;
   }
 
-  std::map<std::string, Row> encrypted_rows;
-  auto block_devices = SQL::selectAllFrom("block_devices");
-  for (const auto& row : block_devices) {
-    const auto name = (row.count("name") > 0) ? row.at("name") : "";
-    const auto uuid = (row.count("uuid") > 0) ? row.at("uuid") : "";
-    const auto parent_name = (row.count("parent") > 0 ? row.at("parent") : "");
-    genFDEStatusForBlockDevice(
-        name, uuid, parent_name, encrypted_rows, results);
+  std::map<std::string, Row> encryption_status;
+  auto query_context = context.constraints["name"].getAll(EQUALS);
+  auto block_devices = enumerateBlockDevices(query_context, true);
+
+  for (const auto& block_device : block_devices) {
+    // Since `genFDEStatusForBlockDevice` is recursive, ensure no duplicates.
+    if (!encryption_status.count(block_device.name)) {
+      genFDEStatusForBlockDevice(
+          block_device, block_devices, encryption_status);
+    }
+
+    results.push_back(encryption_status[block_device.name]);
   }
+
   return results;
 }
-}
-}
+} // namespace tables
+} // namespace osquery

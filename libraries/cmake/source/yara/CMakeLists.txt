@@ -8,7 +8,7 @@
 function(yaraMain)
   set(library_root "${OSQUERY_yara_ROOT_DIR}/libyara")
 
-  add_library(thirdparty_yara
+  set(sources
     "${library_root}/ahocorasick.c"
     "${library_root}/arena.c"
     "${library_root}/atoms.c"
@@ -37,118 +37,151 @@ function(yaraMain)
     "${library_root}/rules.c"
     "${library_root}/scan.c"
     "${library_root}/scanner.c"
+    "${library_root}/simple_str.c"
     "${library_root}/sizedstr.c"
     "${library_root}/stack.c"
     "${library_root}/stopwatch.c"
     "${library_root}/stream.c"
     "${library_root}/strutils.c"
     "${library_root}/threading.c"
-    "${library_root}/modules/demo/demo.c"
+    "${library_root}/tlshc/tlsh.c"
+    "${library_root}/tlshc/tlsh_impl.c"
+    "${library_root}/tlshc/tlsh_util.c"
+    "${library_root}/modules/pe/authenticode-parser/authenticode.c"
+    "${library_root}/modules/pe/authenticode-parser/certificate.c"
+    "${library_root}/modules/pe/authenticode-parser/countersignature.c"
+    "${library_root}/modules/pe/authenticode-parser/helper.c"
+    "${library_root}/modules/pe/authenticode-parser/structs.c"
+    "${library_root}/modules/console/console.c"
     "${library_root}/modules/dex/dex.c"
     "${library_root}/modules/dotnet/dotnet.c"
     "${library_root}/modules/elf/elf.c"
     "${library_root}/modules/hash/hash.c"
     "${library_root}/modules/macho/macho.c"
     "${library_root}/modules/math/math.c"
-    "${library_root}/modules/module_list"
     "${library_root}/modules/pe/pe.c"
     "${library_root}/modules/pe/pe_utils.c"
+    "${library_root}/modules/string/string.c"
     "${library_root}/modules/tests/tests.c"
     "${library_root}/modules/time/time.c"
   )
 
-  if(DEFINED PLATFORM_WINDOWS)
-    target_sources(thirdparty_yara PRIVATE
+  set(yara_strutils_definitions
+    "xtoi=yara_strutils_xtoi"
+    "strnlen_w=yara_strutils_strnlen_w"
+    "strlcpy_w=yara_strutils_strlcpy_w"
+    "strcmp_w=yara_strutils_strcmp_w"
+    "yr_isalnum=yara_strutils_isalnum"
+  )
+
+  if(PLATFORM_POSIX)
+    list(APPEND sources
+      "${library_root}/modules/magic/magic.c"
+    )
+
+    if(PLATFORM_LINUX)
+      list(APPEND sources
+        "${library_root}/proc/linux.c"
+      )
+    elseif(PLATFORM_MACOS)
+      list(APPEND sources
+        "${library_root}/proc/mach.c"
+      )
+    else()
+      message(FATAL_ERROR "Unsupported posix platform")
+    endif()
+  elseif(PLATFORM_WINDOWS)
+    list(APPEND sources
       "${library_root}/proc/windows.c"
-    )
-  elseif(DEFINED PLATFORM_LINUX)
-    target_sources(thirdparty_yara PRIVATE
-      "${library_root}/proc/linux.c"
-      "${library_root}/modules/magic/magic.c"
-    )
-  elseif(DEFINED PLATFORM_MACOS)
-    target_sources(thirdparty_yara PRIVATE
-      "${library_root}/proc/mach.c"
-      "${library_root}/modules/magic/magic.c"
     )
   else()
     message(FATAL_ERROR "Unsupported platform")
   endif()
 
-  target_compile_definitions(thirdparty_yara PRIVATE
-    PACKAGE_NAME=\"yara\"
-    PACKAGE_TARNAME=\"yara\"
-    PACKAGE_VERSION=\"4.0.2\"
-    PACKAGE_STRING=\"yara\ 4.0.2\"
-    PACKAGE_BUGREPORT=\"vmalvarez@virustotal.com\"
-    PACKAGE_URL=\"\"
-    PACKAGE=\"yara\"
-    VERSION=\"4.0.2\"
-    YYTEXT_POINTER=1
-    STDC_HEADERS=1
-    HAVE_SYS_TYPES_H=1
-    HAVE_SYS_STAT_H=1
-    HAVE_STDLIB_H=1
-    HAVE_STRING_H=1
-    HAVE_MEMORY_H=1
-    HAVE_STRINGS_H=1
-    HAVE_INTTYPES_H=1
-    HAVE_STDINT_H=1
-    HAVE_UNISTD_H=1
-    HAVE_DLFCN_H=1
-    LT_OBJDIR=\".libs/\"
-    HAVE_LIBM=1
-    HAVE_STDBOOL_H=1
-    HAVE_CLOCK_GETTIME=1
-    HAVE_SCAN_PROC_IMPL=1
-    HAVE_LIBCRYPTO=1
-    HAVE_OPENSSL_MD5_H=1
-    HAVE_OPENSSL_SHA_H=1
-    HAVE_OPENSSL_ASN1_H=1
-    HAVE_OPENSSL_CRYPTO_H=1
-    HAVE_OPENSSL_BIO_H=1
-    HAVE_OPENSSL_PKCS7_H=1
-    HAVE_OPENSSL_X509_H=1
-    HAVE_OPENSSL_SAFESTACK_H=1
+  add_library(thirdparty_yara ${sources})
+
+  target_link_libraries(thirdparty_yara
+    PRIVATE
+      thirdparty_c_settings
+
+    PUBLIC
+      thirdparty_openssl
   )
 
-  if(DEFINED PLATFORM_LINUX)
+  target_compile_definitions(thirdparty_yara PRIVATE
+    DOTNET_MODULE
+    HASH_MODULE
+    PE_MODULE
+    STRING_MODULE
+    HAVE_LIBCRYPTO=1
+    BUCKETS_256
+    ${yara_strutils_definitions}
+  )
+
+  if(PLATFORM_POSIX)
     target_compile_definitions(thirdparty_yara PRIVATE
-      USE_LINUX_PROC
+      STDC_HEADERS=1
+      HAVE_SYS_TYPES_H=1
+      HAVE_SYS_STAT_H=1
+      HAVE_STDLIB_H=1
+      HAVE_STRING_H=1
+      HAVE_STRINGS_H=1
+      HAVE_INTTYPES_H=1
+      HAVE_STDINT_H=1
+      HAVE_UNISTD_H=1
+      HAVE_DLFCN_H=1
+      HAVE_LIBM=1
       HAVE_MEMMEM=1
       HAVE_TIMEGM=1
+      HAVE_CLOCK_GETTIME=1
+      HAVE_STDBOOL_H=1
+      HAVE_MAGIC_H=1
+      HAVE_LIBMAGIC=1
+      HAVE_OPENSSL_MD5_H=1
+      HAVE_OPENSSL_SHA_H=1
+      HAVE_OPENSSL_ASN1_H=1
+      HAVE_OPENSSL_CRYPTO_H=1
+      HAVE_OPENSSL_BIO_H=1
+      HAVE_OPENSSL_PKCS7_H=1
+      HAVE_OPENSSL_X509_H=1
+      HAVE_OPENSSL_SAFESTACK_H=1
+      HAVE_SCAN_PROC_IMPL=1
+      MAGIC_MODULE
+      MACHO_MODULE
+      DEX_MODULE
     )
 
     target_link_libraries(thirdparty_yara PUBLIC
-      thirdparty_openssl
       thirdparty_libmagic
-    )
-  elseif(DEFINED PLATFORM_MACOS)
-    target_compile_definitions(thirdparty_yara PRIVATE
-      USE_MACH_PROC
-      HAVE_MEMMEM=1
-      HAVE_TIMEGM=1
     )
 
-    target_link_libraries(thirdparty_yara PUBLIC
-      thirdparty_openssl
-      thirdparty_libmagic
-    )
-  elseif(DEFINED PLATFORM_WINDOWS)
+    if(PLATFORM_LINUX)
+      list(APPEND yara_strutils_definitions
+        "strlcpy=yara_strutils_strlcpy"
+        "strlcat=yara_strutils_strlcat"
+      )
+
+      target_compile_definitions(thirdparty_yara PRIVATE
+        HAVE_MEMORY_H=1
+        USE_LINUX_PROC
+        _GNU_SOURCE
+      )
+
+    elseif(PLATFORM_MACOS)
+      target_compile_definitions(thirdparty_yara PRIVATE
+        HAVE_STDIO_H=1
+        HAVE_STRLCAT=1
+        HAVE_STRLCPY=1
+        YYTEXT_POINTER=1
+        USE_MACH_PROC
+        _THREAD_SAFE
+      )
+    endif()
+  elseif(PLATFORM_WINDOWS)
     target_compile_definitions(thirdparty_yara PRIVATE
       USE_WINDOWS_PROC
-      HAVE_MEMMEM=0
-      HAVE_TIMEGM=0
-    )
-
-    target_link_libraries(thirdparty_yara PUBLIC
-      thirdparty_openssl
     )
   endif()
-
-  target_link_libraries(thirdparty_yara PRIVATE
-    thirdparty_c_settings
-  )
 
   target_include_directories(thirdparty_yara PRIVATE
     "${library_root}/include"

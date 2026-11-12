@@ -25,6 +25,7 @@ const std::string kMemInfoPath = {"/proc/meminfo"};
 const std::map<std::string, std::string> kMemInfoMap = {
     {"memory_total", "MemTotal:"},
     {"memory_free", "MemFree:"},
+    {"memory_available", "MemAvailable:"},
     {"buffers", "Buffers:"},
     {"cached", "Cached:"},
     {"swap_cached", "SwapCached:"},
@@ -39,7 +40,7 @@ QueryData getMemoryInfo(QueryContext& context) {
   Row r;
 
   std::string meminfo_content;
-  if (forensicReadFile(kMemInfoPath, meminfo_content).ok()) {
+  if (readFile(kMemInfoPath, meminfo_content).ok()) {
     // Able to read meminfo file, now grab info we want
     for (const auto& line : split(meminfo_content, "\n")) {
       std::vector<std::string> tokens;
@@ -60,5 +61,5 @@ QueryData getMemoryInfo(QueryContext& context) {
   results.push_back(r);
   return results;
 }
-}
-}
+} // namespace tables
+} // namespace osquery

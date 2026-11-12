@@ -41,6 +41,13 @@ TEST_F(OsVersion, test_sanity) {
       {"arch", NonEmptyString},
 #ifdef OSQUERY_WINDOWS
       {"install_date", NonEmptyString},
+      {"revision", NonNegativeInt},
+#endif
+#ifdef OSQUERY_DARWIN
+      {"extra", NormalType},
+#endif
+#ifdef OSQUERY_LINUX
+      {"cpe_name", NormalType},
 #endif
   };
 

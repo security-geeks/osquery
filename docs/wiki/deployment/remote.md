@@ -70,7 +70,8 @@ The most basic TLS-based server should implement 3 HTTP POST endpoints. This API
 
 ```json
 {
-  "node_key": "..." // Optionally blank
+  "node_key": "...", // Optionally blank
+  "etag": "..." // Optional, see "Conditional configuration requests".
 }
 ```
 
@@ -86,11 +87,21 @@ Configuration responses should be exactly the same JSON/format as read by the **
       "interval": 10
     }
   },
-  "node_invalid": false // Optional, return true to indicate re-enrollment.
+  "node_invalid": false, // Optional, return true to indicate re-enrollment.
+  "etag": "..." // Optional, see "Conditional configuration requests".
 }
 ```
 
 The POSTed logger data is exactly the same as logged to disk by the **filesystem** plugin with an additional important key: `log_type`. The filesystem plugin differentiates log types by writing distinct file names. The **tls** plugin includes: `result` or `status`. Snapshot queries are `result` queries.
+
+### Conditional configuration requests
+
+Configurations rarely change between refreshes, so the **tls** config plugin supports conditional requests carried in the JSON bodies (the request is a `POST`, so HTTP `ETag`/`If-None-Match` header semantics do not apply). Servers are free to ignore all of this: a response without an `"etag"` key is treated as the configuration content, byte for byte, exactly as before.
+
+- Unless `--config_tls_etag=false`, the request body includes an `"etag"` field containing the value from the last configuration response the client received, or an empty string when it has none. The value is assigned by the server and is opaque to the client; it is kept in memory only, so a restarted client always requests the full configuration.
+- A server that supports conditional requests includes a top-level `"etag"` key in the configuration response. When the request's etag matches the current one, the server may instead answer with the minimal body `{"etag": "ok"}` to signal that the configuration is unchanged; the client then skips reloading it. The literal value `"ok"` is reserved and never used as a real etag.
+- A server must not answer `{"etag": "ok"}` to a request with an empty etag.
+- A request without an `"etag"` field (an older client, or `--config_tls_etag=false`) must receive the full configuration without an `"etag"` key.
 
 ## Remote logging
 
@@ -175,6 +186,72 @@ As of osquery version 2.1.2, the distributed write API includes a top-level `sta
 }
 ```
 
+### Discovery queries on distributed queries
+
+Distributed queries support "discovery queries", which are similar in semantics to [discovery queries in Packs](./configuration.md#discovery-queries).
+A distributed discovery query controls whether or not a distributed query will be executed on a host.
+- If a distributed query has no corresponding discovery query, then it is always executed on the host.
+- If a discovery query returns one or more results, then its corresponding distributed query will be executed on the host.
+- If a discovery query returns no results, then its corresponding distributed query will not be executed on the host.
+
+Sample of a `distributed/read` response with discovery queries:
+```json
+{
+  "queries": {
+      "always_execute": "select version from osquery_info;",
+      "windows_info": "select name from system_info;",
+      "darwin_time": "select day from time;"
+  },
+  "discovery": {
+      "windows_info": "select * from os_version where platform='windows';",
+      "darwin_time": "select * from os_version where platform='darwin';"
+  }
+}
+```
+
+When processing the above `distributed/read` response, osquery will:
+- Always execute the `"always_execute"` query because there isn't a discovery query defined for it.
+- Only execute `"windows_info"` query on Windows hosts.
+- Only execute `"darwin_time"` on macOS hosts.
+
+Here's the corresponding osquery `distributed/write` request on a Windows host:
+```json
+{
+  "node_key": "...",
+  "queries": {
+    "always_execute": [
+      {"version": "5.5.1"}
+    ],
+    "windows_info": [
+      {"name": "windows"}
+    ]
+  },
+  "statuses": {
+    "always_execute": 0,
+    "windows_info": 0
+  }
+}
+```
+
+Here's the corresponding osquery `distributed/write` request on a macOS host:
+```json
+{
+  "node_key": "...",
+  "queries": {
+    "always_execute": [
+      {"version": "5.4.0"}
+    ],
+    "darwin_time": [
+      {"day": "17"}
+    ]
+  },
+  "statuses": {
+    "always_execute": 0,
+    "darwin_time": 0
+  }
+}
+```
+
 ## Customizations
 
 There are several unlisted flags to further control the remote settings. These controls are helpful if using a somewhat opaque API.
@@ -205,6 +282,15 @@ DH+AES:ECDH+3DES:DH+3DES:RSA+AESGCM:RSA+AES:RSA+3DES:\
 
 Additionally, the osquery TLS clients use a `osquery/X.Y.Z` UserAgent, where "X.Y.Z" is the client build version.
 
+After enrollment, all requests include an `Authorization` header using the `NodeKey` scheme:
+
+```
+Authorization: NodeKey <node_key>
+```
+
+This allows servers and intermediaries to identify and authenticate requests without parsing the request body.
+
+
 ## Example projects
 
 [Doorman](https://github.com/mwielgoszewski/doorman) is a project that implements the TLS remote settings API. Doorman uses "tags", which can be applied to nodes, packs, and queries, in order to dynamically generate configurations for a unique set or all nodes being managed. Doorman also supports the distributed read and write API, allowing an administrator to schedule ad-hoc queries to be run immediately or in the future.
@@ -215,49 +301,29 @@ Additionally, the osquery TLS clients use a `osquery/X.Y.Z` UserAgent, where "X.
 
 The most basic example of a server implementing the remote settings API is the [./tools/tests/test_http_server.py](https://github.com/osquery/osquery/blob/master/tools/tests/test_http_server.py) example script. Let's start this server and have `osqueryd` exercise the API:
 
+Run these commands from the repository root. The required `--test-configs-dir` option selects the directory containing the test certificates and enrollment secret; the server uses the fixture filenames in that directory by default.
+
 ```shell
-$ ./tools/tests/test_http_server.py -h
-usage: test_http_server.py [-h] [--tls] [--persist] [--timeout TIMEOUT]
-                           [--cert CERT_FILE] [--key PRIVATE_KEY_FILE]
-                           [--ca CA_FILE] [--use_enroll_secret]
-                           [--enroll_secret SECRET_FILE]
-                           PORT
-
-osquery python https server for client TLS testing.
-
-positional arguments:
-  PORT                  Bind to which local TCP port.
-
-optional arguments:
-  -h, --help            show this help message and exit
-  --tls                 Wrap the HTTP server socket in TLS.
-  --persist             Wrap the HTTP server socket in TLS.
-  --timeout TIMEOUT     If not persisting, exit after a number of seconds
-  --cert CERT_FILE      TLS server cert.
-  --key PRIVATE_KEY_FILE
-                        TLS server cert private key.
-  --ca CA_FILE          TLS server CA list for client-auth.
-  --use_enroll_secret   Require an enrollment secret for node enrollment
-  --enroll_secret SECRET_FILE
-                        File containing enrollment secret
-$ ./tools/tests/test_http_server.py --tls --persist --cert ./tools/tests/configs/test_server.pem --key ./tools/tests/configs/test_server.key --ca .tools/tests/configs/test_server_ca.pem --use_enroll_secret --enroll_secret ./tools/tests/test_enroll_secret.txt 8080
+$ ./tools/tests/test_http_server.py --help
+$ ./tools/tests/test_http_server.py --tls --persist --verbose \
+    --test-configs-dir ./tools/tests/configs 8080
 -- [DEBUG] Starting TLS/HTTPS server on TCP port: 8080
 ```
 
-This starts a HTTPS server bound to port 8080 using some fake CA/server cert and an example shared enrollment key from the text file **./tools/tests/test_enroll_secret.txt**. If you inspect the file, see that the enrollment secret is **this_is_a_deployment_secret**. The server's enroll step will expect osquery clients to submit this secret.
+This starts a HTTPS server bound to port 8080 using some fake CA/server cert and an example shared enrollment key from the text file **./tools/tests/configs/test_enroll_secret.txt**. If you inspect the file, see that the enrollment secret is **this_is_a_deployment_secret**. The server's enroll step will expect osquery clients to submit this secret.
 
-We will use an `osqueryd` client and set the required TLS settings. When enforcing TLS server authentication, note that the example server is using a toy certificate with the subject: `C=US, ST=California, O=osquery-testing, CN=localhost`:
+With the server running, start the `osqueryd` client in a second terminal from the repository root. When enforcing TLS server authentication, note that the example server is using a toy certificate with the subject: `C=US, ST=California, O=osquery-testing, CN=localhost`:
 
 ```shell
 $ osqueryd --verbose --ephemeral --disable_database \
     --tls_hostname localhost:8080 \
-    --tls_server_certs ./tools/tests/test_server_ca.pem \
+    --tls_server_certs ./tools/tests/configs/test_server_ca.pem \
     --config_plugin tls \
     --config_tls_endpoint /config \
-    --logger_tls_endpoint /logger \
+    --logger_tls_endpoint /log \
     --logger_plugin tls  \
     --enroll_tls_endpoint /enroll \
-    --enroll_secret_path ./tools/tests/test_enroll_secret.txt
+    --enroll_secret_path ./tools/tests/configs/test_enroll_secret.txt
 ```
 
 There are a LOT of command line switches here! The basics notes are (1) set the TLS hostname and port, note that no `https://` is used, as well as the explicit set of certificates to expect; (2) set the plugin options for the config and logger; (3) set the plugin options for enrollment. Turning `verbose` mode on helps describe the expected behavior.
@@ -269,7 +335,7 @@ I1015 10:36:06.936123 2032685056 tls.cpp:196] TLS/HTTPS POST request to URI: htt
 I1015 10:36:06.947465 2032685056 tls.cpp:196] TLS/HTTPS POST request to URI: https://localhost:8080/config
 I1015 10:36:10.288635 3825664 scheduler.cpp:56] Executing query: SELECT * FROM processes;
 I1015 10:36:10.366140 3825664 scheduler.cpp:101] Found results for query (tls_proc) for host: YOURHOSTNAME.local
-I1015 10:36:11.019227 528384 tls.cpp:196] TLS/HTTPS POST request to URI: https://localhost:8080/logger
+I1015 10:36:11.019227 528384 tls.cpp:196] TLS/HTTPS POST request to URI: https://localhost:8080/log
 [...]
 ```
 
@@ -282,7 +348,7 @@ And the example TLS server will show something similar:
 127.0.0.1 - - [15/Oct/2015 10:36:06] "POST /config HTTP/1.1" 200 -
 -- [DEBUG] Request: {u'node_key': u'this_is_a_node_secret'}
 -- [DEBUG] Replying: {u'schedule': {u'tls_proc': {u'query': u'select * from processes', u'interval': 1}}}
-127.0.0.1 - - [15/Oct/2015 10:36:11] "POST /logger HTTP/1.1" 200 -
+127.0.0.1 - - [15/Oct/2015 10:36:11] "POST /log HTTP/1.1" 200 -
 -- [DEBUG] Request: {u'node_key': u'this_is_a_node_secret', u'data': [...]}
 [...]
 ```

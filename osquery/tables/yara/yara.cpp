@@ -19,15 +19,22 @@
 #include <malloc.h>
 #endif
 
+#ifdef WINDOWS
+#include <osquery/tables/system/windows/token_privileges.h>
+#endif
+
 #include <osquery/core/flags.h>
 #include <osquery/core/tables.h>
 #include <osquery/filesystem/filesystem.h>
 #include <osquery/hashing/hashing.h>
 #include <osquery/logger/logger.h>
-#include <osquery/utils/status/status.h>
-
 #include <osquery/remote/uri.h>
+#include <osquery/remote/utility.h>
 #include <osquery/tables/yara/yara_utils.h>
+#include <osquery/utils/status/status.h>
+#include <osquery/worker/ipc/platform_table_container_ipc.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
+#include <osquery/worker/system/memory.h>
 
 #ifdef CONCAT
 #undef CONCAT
@@ -37,15 +44,11 @@
 
 namespace osquery {
 
-// After a large scan of many files, the memory allocation could be
-// substantial.  free() may not return it to operating system, but
-// rather keep it around in anticipation that app will reallocate.
-// Call malloc_trim() on linux to try to convince it to release.
 #ifdef LINUX
-FLAG(bool,
-     yara_malloc_trim,
-     true,
-     "Call malloc_trim() after YARA scans (linux)");
+HIDDEN_FLAG(bool,
+            yara_malloc_trim,
+            true,
+            "Deprecated in favor of malloc_trim_threshold.");
 #endif
 
 FLAG(uint32,
@@ -53,6 +56,12 @@ FLAG(uint32,
      50,
      "Time in ms to sleep after scan of each file (default 50) to reduce "
      "memory spikes");
+
+FLAG(bool,
+     yara_sigurl_authenticate,
+     false,
+     "Enable authentication in yara sigrule requests. Request will be "
+     "authenticated with the node key like other osquery TLS requests.");
 
 HIDDEN_FLAG(bool,
             enable_yara_string,
@@ -63,9 +72,7 @@ HIDDEN_FLAG(bool,
 namespace tables {
 
 using YaraRuleSet = std::set<std::string>;
-
 typedef enum { YC_NONE = 0, YC_GROUP, YC_FILE, YC_RULE, YC_URL } YaraRuleType;
-
 using YARAConfigParser = std::shared_ptr<YARAConfigParserPlugin>;
 
 using YaraScanContext = std::set<std::pair<YaraRuleType, std::string>>;
@@ -96,12 +103,47 @@ static YARAConfigParser getYaraParser(void) {
   YARAConfigParser yaraParser = nullptr;
   try {
     yaraParser = std::dynamic_pointer_cast<YARAConfigParserPlugin>(parser);
-  } catch (const std::bad_cast& e) {
+  } catch (const std::bad_cast&) {
     LOG(ERROR) << "Cannot cast YARA config parser plugin";
     return nullptr;
   }
 
   return yaraParser;
+}
+
+// Create an empty Row to be filled in by the YARA callback
+static Row makeYaraRow(YaraRuleType yr_type, const std::string& sigName) {
+  Row row;
+
+  row["count"] = INTEGER(0);
+  row["matches"] = SQL_TEXT("");
+  row["strings"] = SQL_TEXT("");
+  row["tags"] = SQL_TEXT("");
+  row["sig_group"] = SQL_TEXT("");
+  row["sigfile"] = SQL_TEXT("");
+  row["sigrule"] = SQL_TEXT("");
+
+#ifdef LINUX
+  row["pid_with_namespace"] = "0";
+#endif
+
+  switch (yr_type) {
+  case YC_GROUP:
+    row["sig_group"] = SQL_TEXT(sigName);
+    break;
+  case YC_FILE:
+    row["sigfile"] = SQL_TEXT(sigName);
+    break;
+  case YC_RULE:
+    row["sigrule"] = SQL_TEXT(sigName);
+    break;
+  case YC_URL:
+    row["sigurl"] = SQL_TEXT(sigName);
+    break;
+  case YC_NONE:
+    break;
+  }
+  return row;
 }
 
 bool isRuleUrlAllowed(std::set<std::string> signature_set, std::string url) {
@@ -139,7 +181,21 @@ Status getRuleFromURL(const std::string& url, std::string& rule) {
     http::Response response;
     http::Request request(url);
 
-    response = client.get(request);
+    if (FLAGS_yara_sigurl_authenticate) {
+      // If authentication is turned on, make a POST request with the node key
+      // in the JSON body.
+      JSON params;
+      params.addCopy("node_key", getNodeKey("tls"));
+      std::string postBody;
+      Status result = params.toString(postBody);
+      if (!result.ok()) {
+        return Status::failure("Failed to stringify JSON body: " +
+                               result.getMessage());
+      }
+      response = client.post(request, postBody, "application/json");
+    } else {
+      response = client.get(request);
+    }
     // Check for the status code and update the rule string on success
     // and result has been transmitted to the message body
     if (response.status() == 200) {
@@ -155,47 +211,41 @@ Status getRuleFromURL(const std::string& url, std::string& rule) {
   return Status::success();
 }
 
-void doYARAScan(YR_RULES* rules,
-                const std::string& path,
-                QueryData& results,
-                YaraRuleType yr_type,
-                const std::string& sigfile) {
-  Row row;
-
-  // These are default values, to be updated in YARACallback.
-  row["count"] = INTEGER(0);
-  row["matches"] = SQL_TEXT("");
-  row["strings"] = SQL_TEXT("");
-  row["tags"] = SQL_TEXT("");
-  row["sig_group"] = SQL_TEXT("");
-  row["sigfile"] = SQL_TEXT("");
-  row["sigrule"] = SQL_TEXT("");
+// Scan file by path
+void doYARAScanPath(YR_RULES* rules,
+                    const std::string& path,
+                    QueryData& results,
+                    YaraRuleType yr_type,
+                    const std::string& sigfile) {
+  Row row = makeYaraRow(yr_type, sigfile);
 
   // This could use target_path instead to be consistent with yara_events.
   row["path"] = path;
-
-  switch (yr_type) {
-  case YC_GROUP:
-    row["sig_group"] = SQL_TEXT(sigfile);
-    break;
-  case YC_FILE:
-    row["sigfile"] = SQL_TEXT(sigfile);
-    break;
-  case YC_RULE:
-    row["sigrule"] = SQL_TEXT(sigfile);
-    break;
-  case YC_URL:
-    row["sigurl"] = SQL_TEXT(sigfile);
-    break;
-  case YC_NONE:
-    break;
-  }
 
   // Perform the scan, using the static YARA subscriber callback.
   int result = yr_rules_scan_file(
       rules, path.c_str(), SCAN_FLAGS_FAST_MODE, YARACallback, (void*)&row, 0);
   if (result == ERROR_SUCCESS) {
     results.push_back(std::move(row));
+  }
+}
+
+// Scan process memory by pid
+void doYARAScanPid(YR_RULES* rules,
+                   int pid,
+                   QueryData& results,
+                   YaraRuleType yr_type,
+                   const std::string& sigfile) {
+  Row row = makeYaraRow(yr_type, sigfile);
+  row["pid"] = std::to_string(pid);
+
+  // Perform the scan, using the static YARA subscriber callback.
+  int result = yr_rules_scan_proc(
+      rules, pid, SCAN_FLAGS_FAST_MODE, YARACallback, (void*)&row, 0);
+  if (result == ERROR_SUCCESS) {
+    results.push_back(std::move(row));
+  } else {
+    VLOG(1) << "YARA process scan failed with error code: " << result;
   }
 }
 
@@ -212,31 +262,38 @@ Status getYaraRules(YARAConfigParser parser,
   // Compile signature string and add them to the scan context
   for (const auto& sign : signature_set) {
     // Check if the signature string has been used/compiled
-    if (rules_map.count(hashStr(sign, sign_type)) > 0) {
+    const auto signature_hash = hashStr(sign, sign_type);
+    if (rules_map.count(signature_hash) > 0) {
       context.insert(std::make_pair(sign_type, sign));
       continue;
     }
 
-    YR_RULES* tmp_rules = nullptr;
+    YaraRulesHandle handle(nullptr);
+
     switch (sign_type) {
     case YC_FILE: {
       auto path = (boost::filesystem::path(sign).is_relative())
                       ? (kYARAHome + sign)
                       : sign;
-      auto status = compileSingleFile(path, &tmp_rules);
-      if (!status.ok()) {
-        LOG(WARNING) << "YARA compile error: " << status.toString();
+      auto result = compileSingleFile(path);
+      if (result.isError()) {
+        LOG(WARNING) << "YARA compile error: "
+                     << result.getError().getMessage();
         continue;
       }
+      handle = result.take();
       break;
     }
 
     case YC_RULE: {
-      auto status = compileFromString(sign, &tmp_rules);
-      if (!status.ok()) {
-        LOG(WARNING) << "YARA compile error: " << status.toString();
+      auto result = compileFromString(sign);
+      if (result.isError()) {
+        LOG(WARNING) << "YARA compile error: "
+                     << result.getError().getMessage();
         continue;
       }
+
+      handle = result.take();
       break;
     }
 
@@ -250,11 +307,14 @@ Status getYaraRules(YARAConfigParser parser,
         continue;
       }
 
-      auto status = compileFromString(rule_string, &tmp_rules);
-      if (!status.ok()) {
-        LOG(WARNING) << "YARA compile error: " << status.toString();
+      auto result = compileFromString(rule_string);
+      if (result.isError()) {
+        LOG(WARNING) << "YARA compile error: "
+                     << result.getError().getMessage();
         continue;
       }
+
+      handle = result.take();
       break;
     }
 
@@ -265,74 +325,117 @@ Status getYaraRules(YARAConfigParser parser,
     // Cache the compiled rules by setting the unique hashed signature
     // string as the lookup name. Additional signature file uses will
     // skip the compile step and be added to the scan context
-    rules_map[hashStr(sign, sign_type)] = tmp_rules;
+    rules_map.insert_or_assign(signature_hash, std::move(handle));
     context.insert(std::make_pair(sign_type, sign));
   }
 
   return Status::success();
 }
 
-QueryData genYara(QueryContext& context) {
-  QueryData results;
+class YaraState {
+ public:
   YaraScanContext scanContext;
+  YARAConfigParser yaraParser;
+  Status initStatus;
+  Logger& logger;
 
-  // Initialize yara library
-  auto init_status = yaraInitialize();
-  if (!init_status.ok()) {
-    LOG(WARNING) << init_status.toString();
-    return results;
-  }
+  YaraState(QueryContext& context, Logger& logger) : logger(logger) {
+    initStatus = yaraInitialize();
+    if (!initStatus.ok()) {
+      return;
+    }
 
-  auto yaraParser = getYaraParser();
-  if (isNull(yaraParser)) {
-    return results;
-  }
+    yaraParser = getYaraParser();
+    if (isNull(yaraParser)) {
+      initStatus = Status::failure("YARA config parser plugin not found");
+      return;
+    }
+    // The query must specify one of sig_groups, sigfile, or sigrule
+    // for scan. The signature rules are compiled and added to the
+    // scan context.
+    if (context.hasConstraint("sig_group", EQUALS)) {
+      auto groups = context.constraints["sig_group"].getAll(EQUALS);
+      for (const auto& group : groups) {
+        scanContext.insert(std::make_pair(YC_GROUP, group));
+      }
+    }
 
-  // The query must specify one of sig_groups, sigfile, or sigrule
-  // for scan. The signature rules are compiled and added to the
-  // scan context.
-  if (context.hasConstraint("sig_group", EQUALS)) {
-    auto groups = context.constraints["sig_group"].getAll(EQUALS);
-    for (const auto& group : groups) {
-      scanContext.insert(std::make_pair(YC_GROUP, group));
+    // Compile signature file if query has sigfile constraint and
+    // add them to the scan context
+    if (context.hasConstraint("sigfile", EQUALS)) {
+      auto sigfiles = context.constraints["sigfile"].getAll(EQUALS);
+      auto status = getYaraRules(yaraParser, sigfiles, YC_FILE, scanContext);
+      if (!status.ok()) {
+        initStatus = Status::failure("YARA config parser plugin not found");
+        return;
+      }
+    }
+
+    // Compile signature string if query has sigrule constraint and
+    // add them to the scan context
+    if (context.hasConstraint("sigrule", EQUALS)) {
+      auto sigrules = context.constraints["sigrule"].getAll(EQUALS);
+      auto status = getYaraRules(yaraParser, sigrules, YC_RULE, scanContext);
+      if (!status.ok()) {
+        initStatus = Status::failure("YARA config parser plugin not found");
+        return;
+      }
+    }
+
+    if (context.hasConstraint("sigurl", EQUALS)) {
+      auto sigurls = context.constraints["sigurl"].getAll(EQUALS);
+      auto status = getYaraRules(yaraParser, sigurls, YC_URL, scanContext);
+      if (!status.ok()) {
+        initStatus = Status::failure("YARA config parser plugin not found");
+        return;
+      }
+    }
+
+    // scan context is empty. One of sig_group, sigfile, or sigrule
+    // must be specified with the query
+    if (scanContext.empty()) {
+      initStatus = Status::failure(
+          "Query must specify sig_group, sigfile, sigrule, or sigurl for scan");
+      return;
     }
   }
 
-  // Compile signature file if query has sigfile constraint and
-  // add them to the scan context
-  if (context.hasConstraint("sigfile", EQUALS)) {
-    auto sigfiles = context.constraints["sigfile"].getAll(EQUALS);
-    auto status = getYaraRules(yaraParser, sigfiles, YC_FILE, scanContext);
-    if (!status.ok()) {
-      LOG(WARNING) << status.toString();
-      return results;
+  ~YaraState() {
+    // Rule string is hashed before adding to the cache. There are
+    // possibilities of collision when arbitrary queries are executed
+    // with distributed API. Clear the hash string from the cache
+    // Also cleanup the cache block if rules are downloaded from url
+    auto& rules = yaraParser->rules();
+    for (const auto& sign : scanContext) {
+      if (sign.first == YC_RULE || sign.first == YC_URL) {
+        auto hash = hashStr(sign.second, sign.first);
+        auto it = rules.find(hash);
+        if (it != rules.end()) {
+          rules.erase(hash);
+        }
+      }
     }
-  }
 
-  // Compile signature string if query has sigrule constraint and
-  // add them to the scan context
-  if (context.hasConstraint("sigrule", EQUALS)) {
-    auto sigrules = context.constraints["sigrule"].getAll(EQUALS);
-    auto status = getYaraRules(yaraParser, sigrules, YC_RULE, scanContext);
-    if (!status.ok()) {
-      LOG(WARNING) << status.toString();
-      return results;
+    // Clean-up after finish scanning; If yr_initialize is called
+    // more than once it will decrease the reference counter and return
+    auto fini_status = yaraFinalize();
+    if (!fini_status.ok()) {
+      logger.log(google::GLOG_WARNING, fini_status.toString());
     }
-  }
 
-  if (context.hasConstraint("sigurl", EQUALS)) {
-    auto sigurls = context.constraints["sigurl"].getAll(EQUALS);
-    auto status = getYaraRules(yaraParser, sigurls, YC_URL, scanContext);
-    if (!status.ok()) {
-      LOG(WARNING) << status.toString();
-      return results;
-    }
+#ifdef OSQUERY_LINUX
+    // Attempt to release some unused memory kept by malloc internal caching
+    releaseRetainedMemory();
+#endif
   }
+};
 
-  // scan context is empty. One of sig_group, sigfile, or sigrule
-  // must be specified with the query
-  if (scanContext.empty()) {
-    VLOG(1) << "Query must specify sig_group, sigfile, or sigrule for scan";
+QueryData genYaraFileScanImpl(QueryContext& context, Logger& logger) {
+  QueryData results;
+  YaraState state(context, logger);
+
+  if (!state.initStatus.ok()) {
+    state.logger.log(google::GLOG_ERROR, state.initStatus.toString());
     return results;
   }
 
@@ -364,15 +467,19 @@ QueryData genYara(QueryContext& context) {
       }));
 
   // Scan every path pair with the yara rules
-  auto& rules = yaraParser->rules();
+  auto& rules = state.yaraParser->rules();
+
+  // Scan files
   for (const auto& path : paths) {
-    for (const auto& sign : scanContext) {
-      if (rules.count(hashStr(sign.second, sign.first)) > 0) {
-        doYARAScan(rules[hashStr(sign.second, sign.first)],
-                   path.c_str(),
-                   results,
-                   sign.first,
-                   sign.second);
+    for (const auto& sign : state.scanContext) {
+      auto hash = hashStr(sign.second, sign.first);
+      auto rules_it = rules.find(hash);
+      if (rules_it != rules.end()) {
+        doYARAScanPath(rules_it->second.get(),
+                       path.c_str(),
+                       results,
+                       sign.first,
+                       sign.second);
 
         // sleep between each file to help smooth out malloc spikes
         std::this_thread::sleep_for(
@@ -381,33 +488,70 @@ QueryData genYara(QueryContext& context) {
     }
   }
 
-  // Rule string is hashed before adding to the cache. There are
-  // possibilities of collision when arbitrary queries are executed
-  // with distributed API. Clear the hash string from the cache
-  // Also cleanup the cache block if rules are downloaded from url
-  for (const auto& sign : scanContext) {
-    if (sign.first == YC_RULE || sign.first == YC_URL) {
-      auto it = rules.find(hashStr(sign.second, sign.first));
-      if (it != rules.end()) {
-        rules.erase(hashStr(sign.second, sign.first));
+  return results;
+}
+
+QueryData genYaraProcessScanImpl(QueryContext& context, Logger& logger) {
+  QueryData results;
+  YaraState state(context, logger);
+
+  if (!state.initStatus.ok()) {
+    logger.log(google::GLOG_ERROR, state.initStatus.toString());
+    return results;
+  }
+
+  // Get all pids specified
+  auto pids = context.constraints["pid"].getAll<int>(EQUALS);
+
+  // Scan process memory if pid or pids are specified
+  if (!pids.empty()) {
+#ifdef WINDOWS
+    // Enabling debug token privilege is required for scanning processes that
+    // are not owned by the current user.
+    // It looks like yara internally enables SeDebugPrivilege, but it does not
+    // reset it when the scan is done.  This guard and will ensure that the
+    // privilege is reset to its original state after the scan is done.
+    SeDebugPrivilegeGuard debug_priv_guard;
+#endif
+    // Scan every path pair with the yara rules
+    auto& rules = state.yaraParser->rules();
+
+    // Scan processes
+    for (const auto& pid : pids) {
+      for (const auto& sign : state.scanContext) {
+        auto hash = hashStr(sign.second, sign.first);
+        auto rules_it = rules.find(hash);
+        if (rules_it != rules.end()) {
+          doYARAScanPid(
+              rules_it->second.get(), pid, results, sign.first, sign.second);
+
+          // sleep between each file to help smooth out malloc spikes
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(FLAGS_yara_delay));
+        }
       }
     }
   }
-
-  // Clean-up after finish scanning; If yr_initialize is called
-  // more than once it will decrease the reference counter and return
-  auto fini_status = yaraFinalize();
-  if (!fini_status.ok()) {
-    LOG(WARNING) << fini_status.toString();
-  }
-
-#ifdef LINUX
-  if (osquery::FLAGS_yara_malloc_trim) {
-    malloc_trim(0);
-  }
-#endif
-
   return results;
 }
+
+QueryData genYaraFileScan(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "yara", genYaraFileScanImpl);
+  } else {
+    GLOGLogger logger;
+    return genYaraFileScanImpl(context, logger);
+  }
+}
+
+QueryData genYaraProcessScan(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "yara", genYaraProcessScanImpl);
+  } else {
+    GLOGLogger logger;
+    return genYaraProcessScanImpl(context, logger);
+  }
+}
+
 } // namespace tables
 } // namespace osquery

@@ -89,7 +89,10 @@ TEST_F(ProcessesTest, test_sanity) {
 
   // Add the platform-specific columns.
   if (isPlatform(PlatformType::TYPE_WINDOWS)) {
-    row_map.emplace("is_elevated_token", NormalType);
+    row_map.emplace("elevated_token", IntType);
+    row_map.emplace("secure_process", IntType);
+    row_map.emplace("protection_type", NormalType);
+    row_map.emplace("virtual_process", IntType);
     row_map.emplace("elapsed_time", IntType);
     row_map.emplace("handle_count", IntType);
     row_map.emplace("percent_processor_time", IntType);
@@ -100,7 +103,14 @@ TEST_F(ProcessesTest, test_sanity) {
     row_map.emplace("uppid", IntType);
     row_map.emplace("cpu_type", IntType);
     row_map.emplace("cpu_subtype", IntType);
+    row_map.emplace("translated", IntType);
   }
+
+  if (isPlatform(PlatformType::TYPE_LINUX)) {
+    row_map.emplace("cgroup_path", NormalType);
+    row_map.emplace("label", NormalType);
+  }
+
   validate_rows(data, row_map);
 }
 

@@ -24,10 +24,10 @@
 
 #include <osquery/config/config.h>
 #include <osquery/core/core.h>
-#include <osquery/dispatcher/dispatcher.h>
 #include <osquery/core/flags.h>
-#include <osquery/registry/registry_factory.h>
 #include <osquery/core/system.h>
+#include <osquery/dispatcher/dispatcher.h>
+#include <osquery/registry/registry_factory.h>
 #include <osquery/utils/json/json.h>
 
 #include <plugins/config/parsers/kafka_topics.h>
@@ -53,11 +53,11 @@ FLAG(string,
      "all",
      "The number of acknowledgments the leader has to receive (0, 1, 'all')");
 
-FLAG(
-    string,
-    logger_kafka_compression,
-    "none",
-    "Compression codec to use for compressing message sets ('none' or 'gzip')");
+FLAG(string,
+     logger_kafka_compression,
+     "none",
+     "Compression codec to use for compressing message sets ('none', 'gzip', "
+     "'snappy', 'lz4', or 'zstd')");
 
 /// How often to poll Kafka broker for publish results.
 const std::chrono::seconds kKafkaPollDuration = std::chrono::seconds(5);
@@ -121,7 +121,7 @@ inline std::string getMsgName(const std::string& payload) {
   // If failed to parse as JSON, or JSON object doesn't have "name" top-level
   // key, return base topic
   if (!doc.fromString(payload, JSON::ParseMode::Iterative) ||
-      !doc.doc().HasMember(fieldName)) {
+      !doc.doc().IsObject() || !doc.doc().HasMember(fieldName)) {
     return "";
   }
   auto& name = doc.doc()[fieldName];

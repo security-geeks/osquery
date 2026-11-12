@@ -10,7 +10,9 @@
 // Sanity check integration test for user_ssh_keys
 // Spec file: specs/posix/user_ssh_keys.table
 
+#include <osquery/dispatcher/dispatcher.h>
 #include <osquery/tests/integration/tables/helper.h>
+#include <osquery/tests/test_util.h>
 
 namespace osquery {
 namespace table_tests {
@@ -20,25 +22,40 @@ class userSshKeys : public testing::Test {
   void SetUp() override {
     setUpEnvironment();
   }
+
+#ifdef OSQUERY_WINDOWS
+  static void SetUpTestSuite() {
+    initUsersAndGroupsServices(true, false);
+  }
+
+  static void TearDownTestSuite() {
+    Dispatcher::stopServices();
+    Dispatcher::joinServices();
+    deinitUsersAndGroupsServices(true, false);
+    Dispatcher::instance().resetStopping();
+  }
+#endif
 };
 
 TEST_F(userSshKeys, test_sanity) {
   // 1. Query data
   auto const data = execute_query("select * from user_ssh_keys");
   // 2. Check size before validation
-  // ASSERT_GE(data.size(), 0ul);
+  ASSERT_GE(data.size(), 0ul);
   // ASSERT_EQ(data.size(), 1ul);
   // ASSERT_EQ(data.size(), 0ul);
   // 3. Build validation map
   // See helper.h for available flags
   // Or use custom DataCheck object
-  // ValidationMap row_map = {
-  //      {"uid", IntType}
-  //      {"path", NormalType}
-  //      {"encrypted", IntType}
-  //}
+  ValidationMap row_map = {{"uid", IntType},
+                           {"path", NormalType},
+                           {"encrypted", IntType},
+                           {"key_type", NormalType},
+                           {"key_group_name", NormalType},
+                           {"key_length", IntType},
+                           {"key_security_bits", IntType}};
   // 4. Perform validation
-  // validate_rows(data, row_map);
+  validate_rows(data, row_map);
 }
 
 } // namespace table_tests

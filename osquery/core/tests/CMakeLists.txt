@@ -6,11 +6,13 @@
 # SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
 
 function(osqueryCoreTestsMain)
-  generateOsqueryCoreTestsFlagstestsTest()
-  generateOsqueryCoreTestsSystemtestsTest()
-  generateOsqueryCoreTestsTablestestsTest()
-  generateOsqueryCoreTestsWatcherpermissionstestsTest()
-  generateOsqueryCoreTestsQuerytestsTest()
+  generateOsqueryCoreTestsMergedtestsTest()
+
+  # TODO: This test should actually run as root, but it's currently broken when using that user
+  if(DEFINED PLATFORM_POSIX)
+    generateOsqueryCoreTestsPermissionstestsTest()
+  endif()
+
   generateOsqueryCoreTestsProcesstestsTest()
 
   if(DEFINED PLATFORM_WINDOWS)
@@ -18,99 +20,25 @@ function(osqueryCoreTestsMain)
   endif()
 endfunction()
 
-function(generateOsqueryCoreTestsFlagstestsTest)
-  add_osquery_executable(osquery_core_tests_flagstests-test flags_tests.cpp)
-
-  target_link_libraries(osquery_core_tests_flagstests-test PRIVATE
-    osquery_cxx_settings
-    osquery_core
-    osquery_extensions
-    osquery_extensions_implthrift
-    osquery_registry
-    osquery_utils_info
-    tests_helper
-    thirdparty_googletest
-  )
-endfunction()
-
-function(generateOsqueryCoreTestsSystemtestsTest)
-  add_osquery_executable(osquery_core_tests_systemtests-test system_test.cpp)
-
-  target_link_libraries(osquery_core_tests_systemtests-test PRIVATE
-    osquery_cxx_settings
-    osquery_core
-    osquery_extensions
-    osquery_extensions_implthrift
-    osquery_registry
-    osquery_utils_info
-    tests_helper
-    thirdparty_googletest
-  )
-endfunction()
-
-function(generateOsqueryCoreTestsTablestestsTest)
-  add_osquery_executable(osquery_core_tests_tablestests-test tables_tests.cpp)
-
-  target_link_libraries(osquery_core_tests_tablestests-test PRIVATE
-    osquery_cxx_settings
-    osquery_core
-    osquery_extensions
-    osquery_extensions_implthrift
-    osquery_registry
-    tests_helper
-    osquery_utils_info
-    thirdparty_googletest
-  )
-endfunction()
-
-function(generateOsqueryCoreTestsWatcherpermissionstestsTest)
-
+function(generateOsqueryCoreTestsMergedtestsTest)
   set(source_files
+    flags_tests.cpp
+    query_performance_tests.cpp
+    system_test.cpp
+    tables_tests.cpp
     watcher_tests.cpp
+    query_tests.cpp
   )
 
-  if(DEFINED PLATFORM_POSIX)
-    list(APPEND source_files posix/permissions_tests.cpp)
-  endif()
+  add_osquery_executable(osquery_core_tests_mergedtests-test ${source_files})
 
-  add_osquery_executable(osquery_core_tests_watcherpermissionstests-test ${source_files})
-
-  target_link_libraries(osquery_core_tests_watcherpermissionstests-test PRIVATE
-    osquery_cxx_settings
+  target_link_libraries(osquery_core_tests_mergedtests-test PRIVATE
     osquery_core
+    osquery_cxx_settings
     osquery_extensions
     osquery_extensions_implthrift
     osquery_process
     osquery_registry
-    tests_helper
-    osquery_utils_info
-    thirdparty_googletest
-  )
-endfunction()
-
-function(generateOsqueryCoreTestsQuerytestsTest)
-  add_osquery_executable(osquery_core_tests_querytests-test query_tests.cpp)
-
-  target_link_libraries(osquery_core_tests_querytests-test PRIVATE
-    osquery_cxx_settings
-    osquery_core
-    osquery_extensions
-    osquery_extensions_implthrift
-    osquery_registry
-    osquery_sql_tests_sqltestutils
-    tests_helper
-    osquery_utils_info
-    thirdparty_googletest
-  )
-endfunction()
-
-function(generateOsqueryCoreTestsWmitestsTest)
-  add_osquery_executable(osquery_core_tests_wmitests-test windows/wmi_tests.cpp)
-
-  target_link_libraries(osquery_core_tests_wmitests-test PRIVATE
-    osquery_cxx_settings
-    osquery_config_tests_testutils
-    osquery_core
     osquery_sql_tests_sqltestutils
     osquery_utils_info
     tests_helper
@@ -125,8 +53,44 @@ function(generateOsqueryCoreTestsProcesstestsTest)
     osquery_cxx_settings
     osquery_extensions
     osquery_extensions_implthrift
-    osquery_main
     osquery_process
+    tests_helper
+    thirdparty_googletest
+  )
+endfunction()
+
+# generateOsqueryCoreTestsPermissionstestsTest is posix only, and cannot be merged
+function(generateOsqueryCoreTestsPermissionstestsTest)
+
+  set(source_files
+    posix/permissions_tests.cpp
+  )
+
+  add_osquery_executable(osquery_core_tests_permissionstests-test ${source_files})
+
+  target_link_libraries(osquery_core_tests_permissionstests-test PRIVATE
+    osquery_cxx_settings
+    osquery_core
+    osquery_extensions
+    osquery_extensions_implthrift
+    osquery_process
+    osquery_registry
+    tests_helper
+    osquery_utils_info
+    thirdparty_googletest
+  )
+endfunction()
+
+# generateOsqueryCoreTestsWmitestsTest is windows only, and cannot merge
+function(generateOsqueryCoreTestsWmitestsTest)
+  add_osquery_executable(osquery_core_tests_wmitests-test windows/wmi_tests.cpp)
+
+  target_link_libraries(osquery_core_tests_wmitests-test PRIVATE
+    osquery_cxx_settings
+    osquery_config_tests_testutils
+    osquery_core
+    osquery_sql_tests_sqltestutils
+    osquery_utils_info
     tests_helper
     thirdparty_googletest
   )

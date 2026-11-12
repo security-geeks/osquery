@@ -8,14 +8,17 @@
  */
 
 #include <map>
-#include <regex>
+#include <sstream>
 #include <string>
 
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/replace.hpp>
+#include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/noncopyable.hpp>
 
@@ -25,9 +28,9 @@
 #include <osquery/filesystem/linux/proc.h>
 #include <osquery/logger/logger.h>
 #include <osquery/sql/dynamic_table_row.h>
-
+#include <osquery/tables/system/linux/processes.h>
 #include <osquery/utils/conversions/split.h>
-#include <osquery/utils/system/uptime.h>
+#include <osquery/utils/system/boottime.h>
 
 #include <ctime>
 
@@ -47,13 +50,45 @@ inline std::string readProcCMDLine(const std::string& pid) {
   std::string content;
   readFile(attr, content);
   // Remove \0 delimiters.
-  std::replace_if(content.begin(),
-                  content.end(),
-                  [](const char& c) { return c == 0; },
-                  ' ');
+  std::replace_if(
+      content.begin(),
+      content.end(),
+      [](const char& c) { return c == 0; },
+      ' ');
   // Remove trailing delimiter.
   boost::algorithm::trim(content);
   return content;
+}
+
+std::string parseProcCGroup(const std::string& content) {
+  // Get only the first line
+  // with v1 cgroups we'll have separate lines for different cgroup types
+  auto end_pos = content.find('\n');
+
+  // We should always get something like:
+  // 0::user.slice (for cgroup v2) or
+  // 2:cpu:user.slice (for cgroup v1)
+  // Note that a cgroup name may have colons
+  auto first_colon = content.find(':');
+  if (first_colon == std::string::npos) {
+    return {};
+  }
+  auto second_colon = content.find(':', first_colon + 1);
+  if (second_colon != std::string::npos && second_colon < end_pos) {
+    return content.substr(second_colon + 1, end_pos - second_colon - 1);
+  } else {
+    return {};
+  }
+}
+
+inline std::string readProcCgroup(const std::string& pid) {
+  auto attr = getProcAttr("cgroup", pid);
+
+  std::string content;
+  if (!readFile(attr, content).ok()) {
+    return {};
+  };
+  return parseProcCGroup(content);
 }
 
 inline std::string readProcLink(const std::string& attr,
@@ -61,31 +96,59 @@ inline std::string readProcLink(const std::string& attr,
   // The exe is a symlink to the binary on-disk.
   auto attr_path = getProcAttr(attr, pid);
 
-  std::string result = "";
   struct stat sb;
-  if (lstat(attr_path.c_str(), &sb) != -1) {
-    // Some symlinks may report 'st_size' as zero
-    // Use PATH_MAX as best guess
-    // For cases when 'st_size' is not zero but smaller than
-    // PATH_MAX we will still use PATH_MAX to minimize chance
-    // of output trucation during race condition
-    ssize_t buf_size = sb.st_size < PATH_MAX ? PATH_MAX : sb.st_size;
-    // +1 for \0, since readlink does not append a null
-    char* linkname = static_cast<char*>(malloc(buf_size + 1));
-    ssize_t r = readlink(attr_path.c_str(), linkname, buf_size);
-
-    if (r > 0) { // Success check
-      // r may not be equal to buf_size
-      // if r == buf_size there was race condition
-      // and link is longer than buf_size and because of this
-      // truncated
-      linkname[r] = '\0';
-      result = std::string(linkname);
-    }
-    free(linkname);
+  if (lstat(attr_path.c_str(), &sb) == -1) {
+    return {};
   }
 
-  return result;
+  // Some symlinks may report 'st_size' as zero
+  // Use PATH_MAX as best guess
+  // For cases when 'st_size' is not zero but smaller than
+  // PATH_MAX we will still use PATH_MAX to minimize chance
+  // of output truncation during race condition
+  ssize_t buf_size = std::max(ssize_t{PATH_MAX}, sb.st_size);
+  std::vector<char> linkname(buf_size);
+  ssize_t r = readlink(attr_path.c_str(), linkname.data(), buf_size);
+
+  if (r <= 0) {
+    return {};
+  }
+
+  // r may not be equal to buf_size
+  // if r == buf_size there was a race condition
+  // and link is longer than buf_size and because of this
+  // truncated
+  return std::string(linkname.data(), r);
+}
+
+inline std::string readSecurityLabel(const std::string& pid) {
+  auto label_path = getProcAttr("attr/current", pid);
+  std::string content;
+  return readFile(label_path, content).ok() ? content : "";
+}
+
+std::string parseProcMapsInode(const std::string& content,
+                               const std::string& path) {
+  // The kernel escapes newlines in maps pathnames as "\012"
+  auto escaped_path = path;
+  boost::replace_all(escaped_path, "\n", "\\012");
+
+  for (const auto& line : osquery::split(content, "\n")) {
+    // Each line is "address perms offset dev inode pathname", the pathname
+    // is padded with spaces and may itself contain spaces
+    std::istringstream stream(line);
+    std::string address, perms, offset, dev, inode, pathname;
+    if (!(stream >> address >> perms >> offset >> dev >> inode)) {
+      continue;
+    }
+
+    std::getline(stream >> std::ws, pathname);
+    if (pathname == escaped_path) {
+      return inode;
+    }
+  }
+
+  return {};
 }
 
 // In the case where the linked binary path ends in " (deleted)", and a file
@@ -100,12 +163,10 @@ Status deletedMatchesInode(const std::string& path, const std::string& pid) {
   }
 
   // Extract the expected inode of the binary file from /proc/%pid/maps
-  std::smatch what;
-  std::regex expression("([0-9]+)\\h+\\Q" + path + "\\E");
-  if (!std::regex_search(maps_contents, what, expression)) {
+  auto inode = parseProcMapsInode(maps_contents, path);
+  if (inode.empty()) {
     return Status(-1, "Could not find binary inode in maps file: " + maps_path);
   }
-  std::string inode = what[1];
 
   // stat the file at the expected binary path
   struct stat st;
@@ -137,24 +198,41 @@ std::set<std::string> getProcList(const QueryContext& context) {
   return pidlist;
 }
 
+std::vector<std::pair<std::string, std::string>> parseProcessEnvironment(
+    const std::string& content) {
+  std::vector<std::pair<std::string, std::string>> variables;
+
+  const char* variable = content.c_str();
+  const char* end = variable + content.size();
+
+  // Walk the nul-delimited entries. Comparing against the nul byte rather than
+  // > 0 keeps the walk going past an entry whose first byte has the high bit
+  // set, which is negative where char is signed; otherwise every later entry
+  // is dropped. The end bound keeps the read in range for a block that has no
+  // trailing nul.
+  while (variable < end && *variable != '\0') {
+    auto buf = std::string(variable);
+    size_t idx = buf.find_first_of("=");
+
+    variables.emplace_back(buf.substr(0, idx), buf.substr(idx + 1));
+    variable += buf.size() + 1;
+  }
+
+  return variables;
+}
+
 void genProcessEnvironment(const std::string& pid, QueryData& results) {
   auto attr = getProcAttr("environ", pid);
 
   std::string content;
   readFile(attr, content);
-  const char* variable = content.c_str();
 
-  // Stop at the end of nul-delimited string content.
-  while (*variable > 0) {
-    auto buf = std::string(variable);
-    size_t idx = buf.find_first_of("=");
-
+  for (const auto& variable : parseProcessEnvironment(content)) {
     Row r;
     r["pid"] = pid;
-    r["key"] = buf.substr(0, idx);
-    r["value"] = buf.substr(idx + 1);
+    r["key"] = variable.first;
+    r["value"] = variable.second;
     results.push_back(r);
-    variable += buf.size() + 1;
   }
 }
 
@@ -274,12 +352,32 @@ SimpleProcStat::SimpleProcStat(const std::string& pid) {
       this->name = detail.at(1);
     } else if (detail.at(0) == "VmRSS") {
       detail[1].erase(detail.at(1).end() - 3, detail.at(1).end());
-      // Memory is reported in kB.
-      this->resident_size = detail.at(1) + "000";
+      // Memory is reported in kB (1024 bytes).
+      auto resident_size_result = osquery::tryTo<std::uint64_t>(detail.at(1));
+
+      if (resident_size_result.isError()) {
+        status =
+            Status::failure("Failed to convert VmRSS string value to integer");
+        return;
+      }
+
+      const auto resident_size = resident_size_result.get() * 1024;
+
+      this->resident_size = std::to_string(resident_size);
     } else if (detail.at(0) == "VmSize") {
       detail[1].erase(detail.at(1).end() - 3, detail.at(1).end());
-      // Memory is reported in kB.
-      this->total_size = detail.at(1) + "000";
+      // Memory is reported in kB (1024 bytes).
+      auto virtual_size_result = osquery::tryTo<std::uint64_t>(detail.at(1));
+
+      if (virtual_size_result.isError()) {
+        status =
+            Status::failure("Failed to convert VmSize string value to integer");
+        return;
+      }
+
+      const auto virtual_size = virtual_size_result.get() * 1024;
+
+      this->total_size = std::to_string(virtual_size);
     } else if (detail.at(0) == "Gid") {
       // Format is: R E - -
       auto gid_detail = osquery::split(detail.at(1), "\t");
@@ -393,7 +491,8 @@ int getOnDisk(const std::string& pid, std::string& path) {
 }
 
 void genProcess(const std::string& pid,
-                long system_boot_time,
+                std::uint64_t system_boot_time,
+                QueryContext& context,
                 TableRows& results) {
   // Parse the process stat and status.
   SimpleProcStat proc_stat(pid);
@@ -416,6 +515,9 @@ void genProcess(const std::string& pid,
   r["threads"] = proc_stat.threads;
   // Read/parse cmdline arguments.
   r["cmdline"] = readProcCMDLine(pid);
+  if (context.isColumnUsed("cgroup_path")) {
+    r["cgroup_path"] = readProcCgroup(pid);
+  }
   r["cwd"] = readProcLink("cwd", pid);
   r["root"] = readProcLink("root", pid);
   r["uid"] = proc_stat.real_uid;
@@ -424,6 +526,7 @@ void genProcess(const std::string& pid,
   r["gid"] = proc_stat.real_gid;
   r["egid"] = proc_stat.effective_gid;
   r["sgid"] = proc_stat.saved_gid;
+  r["label"] = readSecurityLabel(pid);
 
   r["on_disk"] = INTEGER(getOnDisk(pid, r["path"]));
 
@@ -440,8 +543,9 @@ void genProcess(const std::string& pid,
 
   auto proc_start_time_exp = tryTo<long>(proc_stat.start_time);
   if (proc_start_time_exp.isValue() && system_boot_time > 0) {
-    r["start_time"] = INTEGER(system_boot_time + proc_start_time_exp.take() /
-                                                     sysconf(_SC_CLK_TCK));
+    auto proc_start_time = proc_start_time_exp.take() / sysconf(_SC_CLK_TCK);
+
+    r["start_time"] = BIGINT(system_boot_time + proc_start_time);
   } else {
     r["start_time"] = "-1";
   }
@@ -482,14 +586,11 @@ void genNamespaces(const std::string& pid, QueryData& results) {
 
 TableRows genProcesses(QueryContext& context) {
   TableRows results;
-  auto system_boot_time = getUptime();
-  if (system_boot_time > 0) {
-    system_boot_time = std::time(nullptr) - system_boot_time;
-  }
+  static const std::uint64_t system_boot_time = getBootTime();
 
   auto pidlist = getProcList(context);
   for (const auto& pid : pidlist) {
-    genProcess(pid, system_boot_time, results);
+    genProcess(pid, system_boot_time, context, results);
   }
 
   return results;
@@ -527,5 +628,5 @@ QueryData genProcessNamespaces(QueryContext& context) {
 
   return results;
 }
-}
-}
+} // namespace tables
+} // namespace osquery

@@ -9,6 +9,7 @@ function(osqueryTablesApplicationsMain)
   if(OSQUERY_BUILD_TESTS)
     add_subdirectory("posix/tests")
     add_subdirectory("chrome/tests")
+    add_subdirectory("tests")
   endif()
 
   generateOsqueryTablesApplications()
@@ -18,17 +19,25 @@ function(generateOsqueryTablesApplications)
   set(source_files
     chrome/chrome_extensions.cpp
     chrome/chrome_extension_content_scripts.cpp
+    chrome/chrome_search_engines.cpp
     chrome/utils.cpp
+    ai_agent_skills.cpp
     browser_firefox.cpp
-    atom_packages.cpp
+    jetbrains_plugins.cpp
+    vscode_extensions.cpp
   )
 
   if(DEFINED PLATFORM_POSIX)
     list(APPEND source_files
       posix/carbon_black.cpp
       posix/docker.cpp
-      posix/lxd.cpp
       posix/prometheus_metrics.cpp
+    )
+  endif()
+
+  if(DEFINED PLATFORM_LINUX)
+    list(APPEND source_files
+      linux/lxd.cpp
     )
   endif()
 
@@ -57,10 +66,20 @@ function(generateOsqueryTablesApplications)
     osquery_utils_json
     plugins_config_parsers
     thirdparty_boost
+    thirdparty_yaml-cpp
   )
+
+  if(DEFINED PLATFORM_MACOS)
+    target_link_libraries(osquery_tables_applications PRIVATE
+      osquery_utils_plist
+      osquery_utils_system_profiler
+    )
+  endif()
 
   set(public_header_files
     chrome/utils.h
+    jetbrains_plugins.h
+    vscode_extensions.h
   )
 
   if(DEFINED PLATFORM_POSIX)

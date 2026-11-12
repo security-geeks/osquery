@@ -29,6 +29,7 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/optional.hpp>
 
 #include <osquery/config/config.h>
 #include <osquery/core/core.h>
@@ -44,11 +45,23 @@
 #include <osquery/numeric_monitoring/numeric_monitoring.h>
 #include <osquery/process/process.h>
 #include <osquery/registry/registry.h>
+#include <osquery/sql/sql.h>
 #include <osquery/utils/config/default_paths.h>
 #include <osquery/utils/info/platform_type.h>
 #include <osquery/utils/info/version.h>
+#include <osquery/utils/pidfile/pidfile.h>
 #include <osquery/utils/system/system.h>
 #include <osquery/utils/system/time.h>
+
+#ifdef WIN32
+#include <osquery/core/windows/global_users_groups_cache.h>
+#include <osquery/system/usersgroups/windows/groups_service.h>
+#include <osquery/system/usersgroups/windows/users_service.h>
+#endif
+
+#if defined(OSQUERY_BUILD_EXPERIMENTS)
+#include <osquery/experiments/loader.h>
+#endif
 
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -108,13 +121,40 @@ DECLARE_bool(disable_database);
 DECLARE_bool(disable_events);
 DECLARE_bool(disable_logging);
 DECLARE_bool(enable_numeric_monitoring);
+DECLARE_bool(ignore_table_exceptions);
+DECLARE_bool(ignore_registry_exceptions);
 
 CLI_FLAG(bool, S, false, "Run as a shell process");
 CLI_FLAG(bool, D, false, "Run as a daemon process");
 CLI_FLAG(bool, daemonize, false, "Attempt to daemonize (POSIX only)");
-CLI_FLAG(uint64, alarm_timeout, 4, "Seconds to wait for a graceful shutdown");
+CLI_FLAG(uint64,
+         alarm_timeout,
+         15,
+         "Seconds to allow for shutdown. Minimum is 10");
+#ifdef OSQUERY_LINUX
+
+/* The default value here is just a placeholder,
+   it will be recalculated at runtime */
+FLAG(uint64,
+     malloc_trim_threshold,
+     200,
+     "Memory threshold in MB used to decide when a malloc_trim will be called "
+     "to reduce the retained memory (Linux only)")
+#endif
+
+/// Should the daemon force unload previously-running osqueryd daemons.
+CLI_FLAG(bool,
+         force,
+         false,
+         "Force osqueryd to kill previously-running daemons");
 
 FLAG(bool, ephemeral, false, "Skip pidfile and database state checks");
+
+/// The path to the pidfile for osqueryd
+CLI_FLAG(string,
+         pidfile,
+         OSQUERY_PIDFILE "osqueryd.pidfile",
+         "Path to the daemon pidfile mutex");
 
 /// The saved thread ID for shutdown to short-circuit raising a signal.
 static std::thread::id kMainThreadId;
@@ -127,7 +167,13 @@ DWORD kLegacyThreadId;
 /// When no flagfile is provided via CLI, attempt to read flag 'defaults'.
 const std::string kBackupDefaultFlagfile{OSQUERY_HOME "osquery.flags.default"};
 
+struct Initializer::PrivateData final {
+  /// Either a pidfile or std::nullopt for ephemeral instances
+  boost::optional<Pidfile> opt_pidfile;
+};
+
 bool Initializer::isWorker_{false};
+std::atomic<bool> Initializer::resource_limit_hit_{false};
 
 namespace {
 
@@ -152,15 +198,31 @@ void initWorkDirectories() {
 void signalHandler(int num) {
   int rc = 0;
 
+  if (num == SIGUSR1) {
+    Initializer::resourceLimitHit();
+  }
+
   // Expect SIGTERM and SIGINT to gracefully shutdown.
   // Other signals are unexpected.
-  if (num != SIGTERM && num != SIGINT) {
+  else if (num != SIGTERM && num != SIGINT) {
     rc = 128 + num;
   }
 
   Initializer::requestShutdown(rc);
 }
+
+bool validateAlarmTimeout(const char* flagname, std::uint64_t value) {
+  if (value < 10) {
+    osquery::systemLog("Alarm timeout cannot be lower than 10 seconds");
+    std::cerr << "Alarm timeout cannot be lower than 10 seconds" << std::endl;
+    return false;
+  }
+
+  return true;
+}
 } // namespace
+
+DEFINE_validator(alarm_timeout, &validateAlarmTimeout);
 
 static inline void printUsage(const std::string& binary, ToolType tool) {
   // Parse help options before gflags. Only display osquery-related options.
@@ -196,7 +258,7 @@ Initializer::Initializer(int& argc,
                          char**& argv,
                          ToolType tool,
                          bool const init_glog)
-    : argc_(&argc), argv_(&argv) {
+    : d(new PrivateData), argc_(&argc), argv_(&argv) {
   // Initialize random number generated based on time.
   std::srand(static_cast<unsigned int>(
       chrono_clock::now().time_since_epoch().count()));
@@ -299,6 +361,14 @@ Initializer::Initializer(int& argc,
     FLAGS_disable_watchdog = true;
   }
 
+  if (Flag::isDefault("ignore_table_exceptions")) {
+    FLAGS_ignore_table_exceptions = true;
+  }
+
+  if (Flag::isDefault("ignore_registry_exceptions")) {
+    FLAGS_ignore_registry_exceptions = true;
+  }
+
   // Initialize registries and plugins
   registryAndPluginInit();
 
@@ -321,6 +391,7 @@ Initializer::Initializer(int& argc,
 
   std::signal(SIGTERM, signalHandler);
   std::signal(SIGINT, signalHandler);
+  std::signal(SIGUSR1, signalHandler);
 
   // If the caller is checking configuration, disable the watchdog/worker.
   if (FLAGS_config_check || FLAGS_database_dump || FLAGS_config_dump) {
@@ -353,6 +424,53 @@ Initializer::Initializer(int& argc,
   platformSetup();
 }
 
+Initializer::~Initializer() {}
+
+bool terminateActiveOsqueryInstance() {
+  auto pid_res = Pidfile::read(FLAGS_pidfile);
+  if (pid_res.isError()) {
+    auto error = pid_res.getErrorCode();
+
+    if (error != Pidfile::Error::NotRunning) {
+      LOG(ERROR) << "Failed to read the pidfile: " << error;
+    }
+
+    return false;
+  }
+
+  auto pid = static_cast<int>(pid_res.take());
+  if (pid == PlatformProcess::getCurrentPid()) {
+    return true;
+  }
+
+  // The pid is running, check if it is an osqueryd process by name.
+  std::stringstream query_text;
+
+  query_text << "SELECT name FROM processes WHERE pid = " << pid
+             << " AND name LIKE 'osqueryd%';";
+
+  SQL q(query_text.str());
+  if (!q.ok()) {
+    LOG(ERROR) << "Error querying processes: " << q.getMessageString();
+    return false;
+  }
+
+  if (q.rows().size() > 0) {
+    // Do not use SIGQUIT as it will cause a crash on OS X.
+    PlatformProcess target(pid);
+    auto kill_succeeded = target.kill();
+
+    LOG(ERROR) << "Killing osqueryd process: " << pid << " ("
+               << (kill_succeeded ? "succeeded" : "failed") << ")";
+
+    return true;
+
+  } else {
+    LOG(ERROR) << "Refusing to kill non-osqueryd process " << pid;
+    return false;
+  }
+}
+
 void Initializer::initDaemon() const {
   if (isWorker() || !isDaemon()) {
     // The worker process (child) will not daemonize.
@@ -377,12 +495,35 @@ void Initializer::initDaemon() const {
   systemLog(binary_ + " started [version=" + kVersion + "]");
 
   if (!FLAGS_ephemeral) {
-    // Create a process mutex around the daemon.
-    auto pid_status = createPidFile();
-    if (!pid_status.ok()) {
-      LOG(ERROR) << binary_ << " initialize failed: " << pid_status.toString();
+    auto pidfile_path = fs::path(FLAGS_pidfile).make_preferred().string();
+
+    auto pidfile_res = Pidfile::create(pidfile_path);
+    if (pidfile_res.isError() &&
+        pidfile_res.getErrorCode() == Pidfile::Error::Busy && FLAGS_force) {
+      if (terminateActiveOsqueryInstance()) {
+        for (int retry = 0; retry < 5; ++retry) {
+          sleepFor(2000);
+
+          pidfile_res = Pidfile::create(pidfile_path);
+          if (pidfile_res.isValue()) {
+            break;
+          }
+
+          VLOG(1) << binary_ << " Pidfile initialization failed: "
+                  << pidfile_res.getErrorCode() << " (retry: " << retry + 1
+                  << "/5)";
+        }
+      }
+    }
+
+    if (pidfile_res.isError()) {
+      LOG(ERROR) << binary_
+                 << " Pidfile check failed: " << pidfile_res.getErrorCode();
+
       shutdownNow(EXIT_FAILURE);
     }
+
+    d->opt_pidfile = pidfile_res.take();
   }
 
   // Nice ourselves if using a watchdog and the level is not too permissive.
@@ -474,6 +615,24 @@ void Initializer::initWorker(const std::string& name) const {
 }
 
 void Initializer::initWorkerWatcher(const std::string& name) const {
+  if (isWorker() || !isWatcher()) {
+#ifdef OSQUERY_WINDOWS
+    std::promise<void> users_cache_promise;
+    std::promise<void> groups_cache_promise;
+    GlobalUsersGroupsCache::global_users_cache_future_ =
+        users_cache_promise.get_future();
+    GlobalUsersGroupsCache::global_groups_cache_future_ =
+        groups_cache_promise.get_future();
+
+    Dispatcher::addService(std::make_shared<UsersService>(
+        std::move(users_cache_promise),
+        GlobalUsersGroupsCache::global_users_cache_));
+    Dispatcher::addService(std::make_shared<GroupsService>(
+        std::move(groups_cache_promise),
+        GlobalUsersGroupsCache::global_groups_cache_));
+#endif
+  }
+
   if (isWorker()) {
     initWorker(name);
   } else {
@@ -557,8 +716,16 @@ void Initializer::start() const {
     }
   }
 
+  if (shutdownRequested()) {
+    return;
+  }
+
   // Then set the config plugin, which uses a single/active plugin.
   initActivePlugin("config", FLAGS_config_plugin);
+
+  if (shutdownRequested()) {
+    return;
+  }
 
   // Run the setup for all lazy registries (tables, SQL).
   Registry::setUp();
@@ -581,6 +748,10 @@ void Initializer::start() const {
     return;
   }
 
+  if (shutdownRequested()) {
+    return;
+  }
+
   // Load the osquery config using the default/active config plugin.
   s = Config::get().load();
   if (!s.ok()) {
@@ -594,23 +765,62 @@ void Initializer::start() const {
 
   // Initialize the status and result plugin logger.
   if (!FLAGS_disable_logging) {
+    if (shutdownRequested()) {
+      return;
+    }
+
     initActivePlugin("logger", FLAGS_logger_plugin);
+
+    if (shutdownRequested()) {
+      return;
+    }
+
     initLogger(binary_);
   }
 
   // Initialize the distributed plugin, if necessary
   if (!FLAGS_disable_distributed) {
+    if (shutdownRequested()) {
+      return;
+    }
+
     initActivePlugin("distributed", FLAGS_distributed_plugin);
   }
 
   if (FLAGS_enable_numeric_monitoring) {
+    if (shutdownRequested()) {
+      return;
+    }
+
     initActivePlugin(monitoring::registryName(),
                      FLAGS_numeric_monitoring_plugins);
   }
 
+  if (shutdownRequested()) {
+    return;
+  }
+
   // Start event threads.
   attachEvents();
+
+  if (shutdownRequested()) {
+    return;
+  }
+
+  // Initialize experiments
+#if defined(OSQUERY_BUILD_EXPERIMENTS)
+  loadExperiments();
+#endif
+
   EventFactory::delay();
+}
+
+void Initializer::resourceLimitHit() {
+  resource_limit_hit_ = true;
+}
+
+bool Initializer::isResourceLimitHit() {
+  return resource_limit_hit_.load();
 }
 
 /**
@@ -631,6 +841,7 @@ class AlarmRunnable : public InterruptibleRunnable {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       waited += 200;
       if (waited > FLAGS_alarm_timeout * 1000) {
+        fflush(stdout);
         Initializer::shutdownNow(EXIT_CATASTROPHIC);
       }
     }
@@ -691,4 +902,4 @@ void Initializer::shutdownNow(int retcode) {
   platformTeardown();
   _Exit(retcode);
 }
-}
+} // namespace osquery

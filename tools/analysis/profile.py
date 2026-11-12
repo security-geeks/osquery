@@ -9,6 +9,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -37,6 +38,12 @@ RANGES = {
 
 def check_leaks_linux(shell, query, count=1, supp_file=None):
     """Run valgrind using the shell and a query, parse leak reports."""
+    if shutil.which("valgrind") is None:
+        raise RuntimeError(
+            "valgrind is required for leak checking on Linux but was "
+            "not found on PATH; install valgrind to use --leaks "
+            "(for example: apt install valgrind)"
+        )
     suppressions = "" if supp_file is None else "--suppressions=%s" % supp_file
     cmd = [
         "valgrind",
@@ -59,12 +66,16 @@ def check_leaks_linux(shell, query, count=1, supp_file=None):
     }
     if args.verbose:
         print(stderr)
-    for line in stderr.split("\n"):
+    # communicate() returns bytes on Python 3; decode before parsing.
+    for line in stderr.decode("utf-8", "replace").split("\n"):
         for key in summary:
             if line.find(key) >= 0:
                 summary[key] = line.split(":")[1].strip()
     if summary["definitely"] is None:
-        raise Exception("Could not execute valgrind correctly")
+        raise Exception(
+            "Could not execute valgrind correctly; no leak summary "
+            "was found in valgrind output"
+        )
     return summary
 
 
@@ -84,13 +95,13 @@ def check_leaks_darwin(shell, query, count=1):
         if args.verbose:
             print(stdout)
         try:
-            for line in stdout.split("\n"):
-                if line.find("total leaked bytes") >= 0:
-                    leak_checks = line.split(":")[1].strip()
+            for line in stdout.split(b"\n"):
+                if line.find(b"total leaked bytes") >= 0:
+                    leak_checks = line.split(b":")[1].strip()
         except:
             print("Encountered exception while running leaks:")
             print(stdout)
-    return {"definitely": leak_checks}
+    return {"definitely": leak_checks.decode("utf-8")}
 
 
 def check_leaks(shell, query, count=1, supp_file=None):
@@ -262,6 +273,10 @@ if __name__ == "__main__":
         help="Use scheduled queries from a config."
     )
     group.add_argument(
+        "--pack", metavar="PACK", default=None,
+        help="Use queries from an osquery pack."
+    )
+    group.add_argument(
         "--query", metavar="STRING", default=None,
         help="Profile a single query."
     )
@@ -280,9 +295,8 @@ if __name__ == "__main__":
         help="Run the profile for N rounds and use the average."
     )
     group.add_argument(
-        "--shell", metavar="PATH", default="./build/%s/osquery/osqueryi" % (
-            utils.platform()),
-        help="Path to osqueryi shell (./build/<sys>/osquery/osqueryi)."
+        "--shell", metavar="PATH", default="./build/osquery/osqueryi",
+        help="Path to osqueryi shell (./build/osquery/osqueryi)."
     )
     group.add_argument(
         "--force", action="store_true", default=False,
@@ -308,7 +322,51 @@ if __name__ == "__main__":
         "--suppressions", metavar="SUPP", default="./tools/analysis/valgrind.supp",
         help="Add a suppressions files to memory leak checking (linux only)."
     )
+
+
+    group = parser.add_argument_group("Threshold Options:")
+    group.add_argument(
+        "--utilization", metavar=("WARN", "ERR", "CRIT"), nargs=3, type=int, default=RANGES["utilization"],
+        help="CPU utilization %% thresholds (default: %(default)s)"
+    )
+    group.add_argument(
+        "--cpu_time", metavar=("WARN", "ERR", "CRIT"), nargs=3, type=float, default=RANGES["cpu_time"],
+        help="CPU time (seconds) thresholds (default: %(default)s)"
+    )
+    group.add_argument(
+        "--memory", metavar=("WARN", "ERR", "CRIT"), nargs=3, type=int, default=RANGES["memory"],
+        help="Memory (bytes) thresholds (default: %(default)s)"
+    )
+    group.add_argument(
+        "--fds", metavar=("WARN", "ERR", "CRIT"), nargs=3, type=int, default=RANGES["fds"],
+        help="File descriptor count thresholds (default: %(default)s)"
+    )
+    group.add_argument(
+        "--duration", metavar=("WARN", "ERR", "CRIT"), nargs=3, type=float, default=RANGES["duration"],
+        help="Query duration (seconds) thresholds (default: %(default)s)"
+    )
+
     args = parser.parse_args()
+
+    # Validate threshold arguments: ensure v1 < v2 < v3
+    def validate_thresholds(name, values):
+        if not (values[0] < values[1] < values[2]):
+            parser.error(f"{name} thresholds must be in increasing order: v1 < v2 < v3 (got {values})")
+
+    validate_thresholds("Utilization", args.utilization)
+    validate_thresholds("CPU time", args.cpu_time)
+    validate_thresholds("Memory", args.memory)
+    validate_thresholds("File descriptors", args.fds)
+    validate_thresholds("Duration", args.duration)
+
+    # Update RANGES with argparse values
+    RANGES.update({
+        "utilization": args.utilization,
+        "cpu_time": args.cpu_time,
+        "memory": args.memory,
+        "fds": args.fds,
+        "duration": args.duration,
+    })
 
     if args.compare:
         with open(args.compare[0]) as fh:
@@ -330,7 +388,10 @@ if __name__ == "__main__":
         exit(1)
 
     queries = {}
+    query_source = "<none provided>"
+
     if args.config is not None:
+        query_source = args.config
         if not os.path.exists(args.config):
             print("Cannot find --config: %s" % (args.config))
             exit(1)
@@ -340,12 +401,24 @@ if __name__ == "__main__":
             for config_file in os.listdir(args.config + ".d"):
                 queries.update(utils.queries_from_config(os.path.join(
                     args.config + ".d", config_file)))
+    elif args.pack is not None:
+        queries = utils.queries_from_pack(args.pack)
     elif args.query is not None:
+        query_source = "--query"
         queries["manual"] = args.query
     elif args.force:
         queries["force"] = True
     else:
+        query_source = args.tables
         queries = utils.queries_from_tables(args.tables, args.restrict)
+
+    if len(queries) == 0:
+        print("0 queries were loaded from %s" % query_source)
+        exit(1)
+    elif len(queries) == 1:
+        print("%d query loaded from %s\n" % (len(queries), query_source))
+    else:
+        print("%d queries loaded from %s\n" % (len(queries), query_source))
 
     if args.leaks:
         results = profile_leaks(

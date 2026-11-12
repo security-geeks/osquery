@@ -9,6 +9,7 @@
 
 #include <iostream>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <osquery/core/core.h>
@@ -22,11 +23,14 @@
 #include "osquery/sql/sqlite_util.h"
 #include <osquery/utils/conversions/tryto.h>
 #include <osquery/utils/json/json.h>
+#include <osquery/utils/status/status.h>
+#include <osquery/utils/system/time.h>
 
 namespace osquery {
 
 DECLARE_string(distributed_tls_read_endpoint);
 DECLARE_string(distributed_tls_write_endpoint);
+DECLARE_uint64(distributed_results_max_bytes);
 
 class DistributedTests : public testing::Test {
  protected:
@@ -155,9 +159,9 @@ TEST_F(DistributedTests, test_deserialize_distributed_query_result) {
   doc.addRef("foo", "bar", row_obj);
 
   auto results_arr = doc.getArray();
-  doc.push(row_obj, results_arr);
-  doc.add("request", request_obj);
-  doc.add("results", results_arr);
+  doc.pushCopy(row_obj, results_arr);
+  doc.addCopy("request", request_obj);
+  doc.addCopy("results", results_arr);
 
   DistributedQueryResult r;
   auto s = deserializeDistributedQueryResult(doc.doc(), r);
@@ -195,15 +199,337 @@ TEST_F(DistributedTests, test_workflow) {
   auto dist = Distributed();
   auto s = dist.pullUpdates();
   ASSERT_TRUE(s.ok()) << s.getMessage();
-  EXPECT_EQ(s.toString(), "OK");
+  EXPECT_EQ(s.getMessage(), "OK");
 
-  EXPECT_EQ(dist.getPendingQueryCount(), 2U);
+  auto queries = dist.getPendingQueries();
+
+  EXPECT_EQ(queries.size(), 2U);
   EXPECT_EQ(dist.results_.size(), 0U);
   s = dist.runQueries();
-  ASSERT_TRUE(s.ok());
-  EXPECT_EQ(s.toString(), "OK");
+  ASSERT_TRUE(s.ok()) << s.getMessage();
+  EXPECT_EQ(s.getMessage(), "OK");
 
-  EXPECT_EQ(dist.getPendingQueryCount(), 0U);
+  queries = dist.getPendingQueries();
+  EXPECT_EQ(queries.size(), 0U);
   EXPECT_EQ(dist.results_.size(), 0U);
+}
+
+TEST_F(DistributedTests, test_check_and_set_as_running) {
+  auto dist = Distributed();
+
+  const auto denylistedQuery = "SELECT * FROM system_info;";
+  const auto denylisted = dist.checkAndSetAsRunning(denylistedQuery);
+  ASSERT_FALSE(denylisted);
+
+  const auto denylistedQueryKey = hashQuery(denylistedQuery);
+
+  std::string ts1;
+  auto status =
+      getDatabaseValue(kDistributedRunningQueries, denylistedQueryKey, ts1);
+  ASSERT_TRUE(status.ok());
+  ASSERT_FALSE(ts1.empty());
+
+  const auto denylisted2 = dist.checkAndSetAsRunning(denylistedQuery);
+  ASSERT_TRUE(denylisted2);
+
+  std::string ts2;
+  status =
+      getDatabaseValue(kDistributedRunningQueries, denylistedQueryKey, ts2);
+  ASSERT_TRUE(status.ok());
+  ASSERT_EQ(ts1, ts2);
+
+  // Change timestamp of the denylisted query so that it's now expired.
+  status =
+      setDatabaseValue(kDistributedRunningQueries,
+                       denylistedQueryKey,
+                       std::to_string(getUnixTime() - denylistDuration() - 60));
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+
+  const auto denylisted3 = dist.checkAndSetAsRunning(denylistedQuery);
+  ASSERT_FALSE(denylisted3);
+
+  // Cleanup should cleanup the expired query.
+  status = dist.cleanupExpiredRunningQueries();
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+
+  std::string ts3;
+  status =
+      getDatabaseValue(kDistributedRunningQueries, denylistedQueryKey, ts3);
+  ASSERT_FALSE(status.ok()); // NotFound
+  ASSERT_TRUE(ts3.empty());
+}
+
+namespace {
+
+/// A distributed plugin whose writes always fail.
+class FailingWriteDistributedPlugin : public DistributedPlugin {
+ public:
+  Status getQueries(std::string& json) override {
+    json = "{}";
+    return Status::success();
+  }
+
+  Status writeResults(const std::string& json) override {
+    return Status::failure("write failed");
+  }
+};
+
+/// Make the distributed plugin whose writes always fail the active one.
+Status activateFailingWritePlugin() {
+  auto& rf = RegistryFactory::get();
+  if (!rf.exists("distributed", "failing_write")) {
+    rf.registry("distributed")
+        ->add("failing_write",
+              std::make_shared<FailingWriteDistributedPlugin>());
+  }
+  return rf.setActive("distributed", "failing_write");
+}
+
+DistributedQueryResult makeResult(const std::string& id,
+                                  const std::string& value = "") {
+  DistributedQueryRequest request;
+  request.id = id;
+  request.query = "SELECT 1";
+  return DistributedQueryResult(
+      request,
+      {{{"value", value.empty() ? std::string(100, 'x') : value}}},
+      {"value"},
+      Status(),
+      "");
+}
+
+} // namespace
+
+// Results that fail to write are kept for the next flush, unless they have
+// grown beyond distributed_results_max_bytes.
+TEST_F(DistributedTests, test_failed_results_kept_up_to_max_bytes) {
+  ASSERT_TRUE(activateFailingWritePlugin().ok());
+  const auto max_bytes = FLAGS_distributed_results_max_bytes;
+
+  auto dist = Distributed();
+  dist.addResult(makeResult("q1"));
+  dist.addResult(makeResult("q2"));
+
+  // Under the limit, the results are kept to retry.
+  FLAGS_distributed_results_max_bytes = 1024 * 1024;
+  EXPECT_FALSE(dist.flushCompleted().ok());
+  EXPECT_EQ(dist.results_.size(), 2U);
+
+  // A new result is retried along with the kept ones.
+  dist.addResult(makeResult("q3"));
+  EXPECT_FALSE(dist.flushCompleted().ok());
+  EXPECT_EQ(dist.results_.size(), 3U);
+
+  // Over the limit, they are dropped.
+  FLAGS_distributed_results_max_bytes = 100;
+  EXPECT_FALSE(dist.flushCompleted().ok());
+  EXPECT_EQ(dist.results_.size(), 0U);
+
+  // With no limit, they are always kept.
+  dist.addResult(makeResult("q4"));
+  FLAGS_distributed_results_max_bytes = 0;
+  EXPECT_FALSE(dist.flushCompleted().ok());
+  EXPECT_EQ(dist.results_.size(), 1U);
+
+  // The plugin is left active: re-activating the tls plugin would try to
+  // enroll. Tests that use a distributed plugin activate it themselves.
+  FLAGS_distributed_results_max_bytes = max_bytes;
+}
+
+// A server may reissue a query ID while writes keep failing. Only the latest
+// result for an ID is written, so it replaces the kept one; otherwise kept
+// results would grow without the serialized size ever reaching the limit.
+TEST_F(DistributedTests, test_failed_results_replaced_by_same_id) {
+  ASSERT_TRUE(activateFailingWritePlugin().ok());
+
+  auto dist = Distributed();
+  dist.addResult(makeResult("q1"));
+  for (size_t i = 0; i < 10; ++i) {
+    dist.addResult(makeResult("q2", "run " + std::to_string(i)));
+    EXPECT_FALSE(dist.flushCompleted().ok());
+  }
+
+  ASSERT_EQ(dist.results_.size(), 2U);
+  EXPECT_EQ(dist.results_[0].request.id, "q1");
+  EXPECT_EQ(dist.results_[1].request.id, "q2");
+  EXPECT_EQ(dist.results_[1].results[0].at("value"), "run 9");
+}
+
+class DistributedMock : public Distributed {
+ public:
+  DistributedMock() : Distributed() {}
+  MOCK_METHOD0(flushCompleted, Status());
+};
+
+TEST_F(DistributedTests, test_run_queries_with_denylisted_query) {
+  auto dist = DistributedMock();
+  // flushCompleted is mocked to avoid sending results in
+  // Distributed.runQueries.
+  EXPECT_CALL(dist, flushCompleted).Times(2);
+
+  // Simulate a denylisted query by manually marking it as running.
+  const auto denylistedQuery = "SELECT * FROM osquery_info;";
+  const auto denylisted = dist.checkAndSetAsRunning(denylistedQuery);
+  ASSERT_FALSE(denylisted);
+
+  const auto denylistedQueryKey = hashQuery(denylistedQuery);
+
+  const std::string work = R"json(
+{
+  "queries": {
+    "q1": "SELECT * FROM osquery_info;",
+    "q2": "SELECT * FROM osquery_info WHERE CAST(split(version, '.', 0) as integer) >= 5"
+  }
+}
+)json";
+  auto status = dist.acceptWork(work);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  status = dist.runQueries();
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+
+  // Query q1 is denylisted, only query q2 ran.
+  ASSERT_EQ(dist.results_.size(), 2);
+  auto q1Idx = 0, q2Idx = 1;
+  if (dist.results_[0].request.id.compare("q2") == 0) {
+    q1Idx = 1;
+    q2Idx = 0;
+  }
+  EXPECT_FALSE(dist.results_[q1Idx].status.ok());
+  EXPECT_TRUE(dist.results_[q1Idx].results.empty());
+  EXPECT_EQ(dist.results_[q1Idx].status.getMessage(), "Denylisted");
+  EXPECT_EQ(dist.results_[q1Idx].message, "distributed query is denylisted");
+  EXPECT_TRUE(dist.results_[q2Idx].status.ok());
+  EXPECT_FALSE(dist.results_[q2Idx].results.empty());
+
+  // Manually clear results.
+  dist.results_.clear();
+
+  // Cleanup should not yet cleanup the denylisted query.
+  status = dist.cleanupExpiredRunningQueries();
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  std::string ts;
+  status = getDatabaseValue(kDistributedRunningQueries, denylistedQueryKey, ts);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  ASSERT_FALSE(ts.empty());
+
+  // Change timestamp of the denylisted query so that it's now expired.
+  status =
+      setDatabaseValue(kDistributedRunningQueries,
+                       denylistedQueryKey,
+                       std::to_string(getUnixTime() - denylistDuration() - 60));
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+
+  // Query q1 should not by denylisted anymore.
+  auto s = dist.acceptWork(work);
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  status = dist.runQueries();
+  ASSERT_TRUE(status.ok()) << status.getMessage();
+  ASSERT_EQ(dist.results_.size(), 2);
+  EXPECT_TRUE(dist.results_[0].status.ok());
+  EXPECT_TRUE(dist.results_[0].request.id == "q1" ||
+              dist.results_[0].request.id == "q2");
+  EXPECT_TRUE(dist.results_[1].status.ok());
+  EXPECT_TRUE(dist.results_[1].request.id == "q1" ||
+              dist.results_[1].request.id == "q2");
+
+  // Query q1 should not be marked as denylisted anymore.
+  std::string ts2;
+  status =
+      getDatabaseValue(kDistributedRunningQueries, denylistedQueryKey, ts2);
+  ASSERT_FALSE(status.ok()); // NotFound
+  ASSERT_TRUE(ts2.empty());
+}
+
+TEST_F(DistributedTests, test_accept_work_basic) {
+  auto dist = Distributed();
+
+  const std::string work = R"json(
+{
+  "queries": {
+    "q1": "SELECT * FROM system_info;",
+    "q2": "SELECT * FROM osquery_info;"
+  }
+}
+)json";
+  auto s = dist.acceptWork(work);
+  ASSERT_TRUE(s.ok()) << s.getMessage();
+  const auto queries = dist.getPendingQueries();
+  ASSERT_EQ(queries.size(), 2);
+  for (const auto& queryName : queries) {
+    ASSERT_FALSE(queryName.compare("q1") && queryName.compare("q2"))
+        << queryName;
+    std::string actualQuery;
+    s = getDatabaseValue(kDistributedQueries, queryName, actualQuery);
+    ASSERT_TRUE(s.ok()) << s.getMessage();
+    std::string expectedQuery;
+    if (queryName.compare("q1") == 0) {
+      expectedQuery = "SELECT * FROM system_info;";
+    } else { // q2
+      expectedQuery = "SELECT * FROM osquery_info;";
+    }
+    EXPECT_EQ(actualQuery, expectedQuery);
+  }
+}
+
+TEST_F(DistributedTests, test_accept_work_with_discovery) {
+  auto dist = Distributed();
+
+  const std::string work = R"json(
+{
+  "queries": {
+    "q1": "SELECT * FROM system_info;",
+    "q2": "SELECT * FROM time;",
+    "q3": "SELECT * FROM osquery_info;"
+  },
+  "discovery": {
+    "q1": "SELECT 1;",
+    "q2": "SELECT 1 WHERE false;"
+  }
+}
+)json";
+  auto s = dist.acceptWork(work);
+  ASSERT_TRUE(s.ok()) << s.getMessage();
+
+  // Query q1 has a discovery query with > 0 results.
+  // Query q2 has a discovery query with 0 results, thus it won't be executed.
+  // Query q3 does not have a discovery query, thus it will be executed.
+  const auto queryNames = dist.getPendingQueries();
+  ASSERT_EQ(queryNames.size(), 2);
+  for (const auto& queryName : queryNames) {
+    ASSERT_TRUE(queryName == "q1" || queryName == "q3");
+    std::string actualQuery;
+    s = getDatabaseValue(kDistributedQueries, queryName, actualQuery);
+    ASSERT_TRUE(s.ok()) << s.getMessage();
+    std::string expectedQuery = "SELECT * FROM system_info;";
+    if (queryName == "q3") {
+      expectedQuery = "SELECT * FROM osquery_info;";
+    }
+    EXPECT_EQ(actualQuery, expectedQuery);
+  }
+}
+
+// Tests https://github.com/osquery/osquery/issues/5260.
+TEST_F(DistributedTests, test_accept_work_with_discovery_all_fail) {
+  auto dist = Distributed();
+
+  const std::string work = R"json(
+{
+  "queries": {
+    "q1": "SELECT * FROM system_info;",
+    "q2": "SELECT * FROM osquery_info;"
+  },
+  "discovery": {
+    "q1": "SELECT 1 WHERE false;",
+    "q2": "SELECT 1 WHERE false;"
+  }
+}
+)json";
+  auto s = dist.acceptWork(work);
+  ASSERT_TRUE(s.ok()) << s.getMessage();
+
+  // Both queries q1 and q2 have a discovery query with 0 results,
+  // thus they won't be executed.
+  const auto queries = dist.getPendingQueries();
+  ASSERT_EQ(queries.size(), 0);
 }
 } // namespace osquery
